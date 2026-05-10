@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without leading v, for example 1.2.3
+        required: true
+        type: string
+      build_number:
+        description: Optional Flutter build number / Debian revision
+        required: false
+        type: string
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux-deb:
+    name: Build Linux .deb
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+            BUILD_NUMBER="${{ inputs.build_number }}"
+            if [[ -z "$BUILD_NUMBER" ]]; then
+              BUILD_NUMBER="${{ github.run_number }}"
+            fi
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            PUBSPEC_VERSION="$(awk '/^version:/ {print $2}' tools/ja4-spoofer/pubspec.yaml)"
+            PUBSPEC_APP_VERSION="${PUBSPEC_VERSION%%+*}"
+            BUILD_NUMBER="${PUBSPEC_VERSION#*+}"
+            if [[ "$BUILD_NUMBER" == "$PUBSPEC_VERSION" ]]; then
+              BUILD_NUMBER="1"
+            fi
+            if [[ "$PUBSPEC_APP_VERSION" != "$VERSION" ]]; then
+              echo "::error::Tag $TAG does not match pubspec version $PUBSPEC_APP_VERSION"
+              exit 1
+            fi
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must be semantic X.Y.Z"
+            exit 1
+          fi
+          if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Build number must be numeric"
+            exit 1
+          fi
+
+          TAG="v$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Commit release version and tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          perl -0pi -e 's/^version:\s+.*/version: '"$VERSION+$BUILD_NUMBER"'/m' tools/ja4-spoofer/pubspec.yaml
+
+          git add tools/ja4-spoofer/pubspec.yaml
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: release $TAG"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            curl \
+            dpkg-dev \
+            git \
+            libgtk-3-dev \
+            liblzma-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Install Flutter
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Flutter doctor
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          flutter config --enable-linux-desktop
+          flutter doctor -v
+
+      - name: Resolve Flutter packages
+        working-directory: tools/ja4-spoofer
+        shell: bash
+        run: flutter pub get
+
+      - name: Run Flutter tests
+        working-directory: tools/ja4-spoofer
+        shell: bash
+        run: flutter test
+
+      - name: Build .deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/ja4-spoofer/scripts/package_linux_deb.sh \
+            --version "$VERSION" \
+            --build-number "$BUILD_NUMBER"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Release $TAG"
+          fi
+          gh release upload "$TAG" tools/ja4-spoofer/dist/*.deb --clobber

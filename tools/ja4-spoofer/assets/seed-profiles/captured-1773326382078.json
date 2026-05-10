@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "profile_id": "captured-1773326382078",
+  "metadata": {
+    "name": "Brave",
+    "source": "captured",
+    "captured_at": "2026-03-12T15:39:42.078374",
+    "icon_url": "https://upload.wikimedia.org/wikipedia/commons/9/93/Brave_Logo_%282024%29.svg",
+    "version": "1.88.127 (Official Build) (arm64)"
+  },
+  "inputs": {
+    "tls_client_hello": {
+      "tls_min_version": "1.2",
+      "tls_max_version": "1.3",
+      "cipher_suites": [
+        4865,
+        4866,
+        4867,
+        49195,
+        49199,
+        49196,
+        49200,
+        52393,
+        52392,
+        49171,
+        49172,
+        156,
+        157,
+        47,
+        53
+      ],
+      "alpn_protocols": [
+        "h2",
+        "http/1.1"
+      ],
+      "extensions": [
+        45,
+        11,
+        10,
+        13,
+        0,
+        17613,
+        65037,
+        27,
+        35,
+        18,
+        43,
+        16,
+        51,
+        5,
+        23,
+        65281
+      ],
+      "signature_algorithms": [
+        1027,
+        2052,
+        1025,
+        1283,
+        2053,
+        1281,
+        2054,
+        1537
+      ],
+      "enable_grease": true,
+      "enable_ch_xtn_permutation": false,
+      "sni_mode": "present"
+    }
+  }
+}

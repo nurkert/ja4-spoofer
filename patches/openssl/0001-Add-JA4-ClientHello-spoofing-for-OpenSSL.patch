@@ -1,0 +1,3084 @@
+From ae093c50c2dcd5fa9d3599a7b6675814c44b31cd Mon Sep 17 00:00:00 2001
+From: Niko Burkert <nurkert@local>
+Date: Sun, 10 May 2026 13:44:03 +0200
+Subject: [PATCH] add JA4 ClientHello spoofing for OpenSSL
+
+---
+ ssl/build.info               |    1 +
+ ssl/ja4.c                    | 1887 ++++++++++++++++++++++++++++++++++
+ ssl/ssl_local.h              |   46 +
+ ssl/statem/extensions.c      |  309 +++++-
+ ssl/statem/extensions_clnt.c |  240 ++++-
+ ssl/statem/statem_clnt.c     |  279 ++++-
+ 6 files changed, 2694 insertions(+), 68 deletions(-)
+ create mode 100644 ssl/ja4.c
+
+diff --git a/ssl/build.info b/ssl/build.info
+index d293d966b6..5e172f31ec 100644
+--- a/ssl/build.info
++++ b/ssl/build.info
+@@ -8,6 +8,7 @@ SOURCE[../libssl]=\
+         statem/statem_lib.c statem/extensions.c statem/extensions_srvr.c \
+         statem/extensions_clnt.c statem/extensions_cust.c s3_msg.c \
+         methods.c t1_lib.c  t1_enc.c tls13_enc.c \
++        ja4.c \
+         d1_lib.c d1_msg.c \
+         statem/statem_dtls.c d1_srtp.c \
+         ssl_lib.c ssl_cert.c ssl_sess.c \
+diff --git a/ssl/ja4.c b/ssl/ja4.c
+new file mode 100644
+index 0000000000..64c68624ed
+--- /dev/null
++++ b/ssl/ja4.c
+@@ -0,0 +1,1887 @@
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <errno.h>
++
++#include "internal/cryptlib.h"
++#include <openssl/rand.h>
++#include "ssl_local.h"
++
++typedef enum {
++    OSSL_JA4_MODE_NONE = 0,
++    OSSL_JA4_MODE_REORDER_VAL = OSSL_JA4_MODE_REORDER,
++    OSSL_JA4_MODE_EXACT_VAL = OSSL_JA4_MODE_EXACT
++} OSSL_JA4_MODE;
++
++typedef enum {
++    OSSL_JA4_SNI_UNSET = 0,
++    OSSL_JA4_SNI_PRESENT,
++    OSSL_JA4_SNI_DOMAIN,
++    OSSL_JA4_SNI_NONE,
++    OSSL_JA4_SNI_IP
++} OSSL_JA4_SNI_MODE;
++
++typedef struct {
++    int active;
++    int strict_set;
++    int strict_enabled;
++    int tls_min_set;
++    int tls_min;
++    int tls_max_set;
++    int tls_max;
++    uint16_t *cipher_suites;
++    size_t cipher_suites_len;
++    OSSL_JA4_MODE cipher_mode;
++    unsigned char *alpn_wire;
++    size_t alpn_wire_len;
++    uint16_t *signature_algorithms;
++    size_t signature_algorithms_len;
++    uint16_t *supported_versions;
++    size_t supported_versions_len;
++    uint16_t *supported_groups;
++    size_t supported_groups_len;
++    uint16_t *key_share_groups;
++    size_t key_share_groups_len;
++    unsigned char *psk_key_exchange_modes;
++    size_t psk_key_exchange_modes_len;
++    uint16_t *extension_order;
++    size_t extension_order_len;
++    OSSL_JA4_MODE extension_mode;
++    OSSL_JA4_SNI_MODE sni_mode;
++    int grease_set;
++    int grease_enabled;
++    int grease_value_set;
++    uint16_t grease_value;
++    int enable_ch_xtn_permutation;
++    int enable_ch_xtn_permutation_set;
++} OSSL_JA4_CONFIG;
++
++typedef struct {
++    OSSL_JA4_CONFIG config;
++    uint16_t *final_cipher_suites;
++    size_t final_cipher_suites_len;
++    uint16_t *final_signature_algorithms;
++    size_t final_signature_algorithms_len;
++    uint16_t *final_extensions;
++    size_t final_extensions_len;
++    uint16_t *final_supported_versions;
++    size_t final_supported_versions_len;
++    uint16_t *final_supported_groups;
++    size_t final_supported_groups_len;
++    uint16_t *final_key_share_groups;
++    size_t final_key_share_groups_len;
++    unsigned char *final_psk_key_exchange_modes;
++    size_t final_psk_key_exchange_modes_len;
++    uint32_t mismatch_mask;
++    int apply_ok;
++} OSSL_JA4_STATE;
++
++static OSSL_JA4_STATE ossl_ja4_state = {{0}, NULL, 0, NULL, 0, NULL, 0};
++
++static const uint16_t ossl_ja4_grease_values[] = {
++    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a,
++    0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
++    0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
++    0xcaca, 0xdada, 0xeaea, 0xfafa
++};
++
++static void ossl_ja4_reset_dynamic(uint16_t **vals, size_t *vals_len)
++{
++    OPENSSL_free(*vals);
++    *vals = NULL;
++    *vals_len = 0;
++}
++
++static void ossl_ja4_reset_config(OSSL_JA4_CONFIG *cfg)
++{
++    OPENSSL_free(cfg->cipher_suites);
++    OPENSSL_free(cfg->alpn_wire);
++    OPENSSL_free(cfg->signature_algorithms);
++    OPENSSL_free(cfg->supported_versions);
++    OPENSSL_free(cfg->supported_groups);
++    OPENSSL_free(cfg->key_share_groups);
++    OPENSSL_free(cfg->psk_key_exchange_modes);
++    OPENSSL_free(cfg->extension_order);
++    memset(cfg, 0, sizeof(*cfg));
++}
++
++static void ossl_ja4_reset_state(void)
++{
++    ossl_ja4_reset_config(&ossl_ja4_state.config);
++    ossl_ja4_reset_dynamic(&ossl_ja4_state.final_cipher_suites,
++        &ossl_ja4_state.final_cipher_suites_len);
++    ossl_ja4_reset_dynamic(&ossl_ja4_state.final_signature_algorithms,
++        &ossl_ja4_state.final_signature_algorithms_len);
++    ossl_ja4_reset_dynamic(&ossl_ja4_state.final_extensions,
++        &ossl_ja4_state.final_extensions_len);
++    ossl_ja4_reset_dynamic(&ossl_ja4_state.final_supported_versions,
++        &ossl_ja4_state.final_supported_versions_len);
++    ossl_ja4_reset_dynamic(&ossl_ja4_state.final_supported_groups,
++        &ossl_ja4_state.final_supported_groups_len);
++    ossl_ja4_reset_dynamic(&ossl_ja4_state.final_key_share_groups,
++        &ossl_ja4_state.final_key_share_groups_len);
++    OPENSSL_free(ossl_ja4_state.final_psk_key_exchange_modes);
++    ossl_ja4_state.final_psk_key_exchange_modes = NULL;
++    ossl_ja4_state.final_psk_key_exchange_modes_len = 0;
++    ossl_ja4_state.mismatch_mask = 0;
++    ossl_ja4_state.apply_ok = 0;
++}
++
++static char *ossl_ja4_trim(char *value)
++{
++    char *end;
++
++    while (*value != '\0' && (*value == ' ' || *value == '\t'
++            || *value == '\r' || *value == '\n')) {
++        value++;
++    }
++
++    end = value + strlen(value);
++    while (end > value) {
++        char c = end[-1];
++
++        if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
++            break;
++        end--;
++    }
++    *end = '\0';
++    return value;
++}
++
++static int ossl_ja4_parse_tls_version(const char *value, int *out)
++{
++    if (strcmp(value, "1.0") == 0) {
++        *out = TLS1_VERSION;
++        return 1;
++    }
++    if (strcmp(value, "1.1") == 0) {
++        *out = TLS1_1_VERSION;
++        return 1;
++    }
++    if (strcmp(value, "1.2") == 0) {
++        *out = TLS1_2_VERSION;
++        return 1;
++    }
++    if (strcmp(value, "1.3") == 0) {
++        *out = TLS1_3_VERSION;
++        return 1;
++    }
++
++    {
++        char *end = NULL;
++        unsigned long parsed = strtoul(value, &end, 0);
++
++        if (end != NULL && *end == '\0' && parsed <= 0xffffUL) {
++            *out = (int)parsed;
++            return 1;
++        }
++    }
++
++    return 0;
++}
++
++static int ossl_ja4_parse_mode(const char *value, OSSL_JA4_MODE *out)
++{
++    if (OPENSSL_strcasecmp(value, "reorder") == 0) {
++        *out = OSSL_JA4_MODE_REORDER_VAL;
++        return 1;
++    }
++    if (OPENSSL_strcasecmp(value, "exact") == 0) {
++        *out = OSSL_JA4_MODE_EXACT_VAL;
++        return 1;
++    }
++    return 0;
++}
++
++static int ossl_ja4_parse_sni_mode(const char *value, OSSL_JA4_SNI_MODE *out)
++{
++    if (OPENSSL_strcasecmp(value, "present") == 0) {
++        *out = OSSL_JA4_SNI_PRESENT;
++        return 1;
++    }
++    if (OPENSSL_strcasecmp(value, "domain") == 0) {
++        *out = OSSL_JA4_SNI_DOMAIN;
++        return 1;
++    }
++    if (OPENSSL_strcasecmp(value, "none") == 0) {
++        *out = OSSL_JA4_SNI_NONE;
++        return 1;
++    }
++    if (OPENSSL_strcasecmp(value, "ip") == 0) {
++        *out = OSSL_JA4_SNI_IP;
++        return 1;
++    }
++    return 0;
++}
++
++static int ossl_ja4_parse_bool(const char *value, int *out)
++{
++    if (OPENSSL_strcasecmp(value, "1") == 0
++        || OPENSSL_strcasecmp(value, "true") == 0
++        || OPENSSL_strcasecmp(value, "yes") == 0
++        || OPENSSL_strcasecmp(value, "on") == 0) {
++        *out = 1;
++        return 1;
++    }
++    if (OPENSSL_strcasecmp(value, "0") == 0
++        || OPENSSL_strcasecmp(value, "false") == 0
++        || OPENSSL_strcasecmp(value, "no") == 0
++        || OPENSSL_strcasecmp(value, "off") == 0) {
++        *out = 0;
++        return 1;
++    }
++    return 0;
++}
++
++static int ossl_ja4_parse_csv_u16(const char *value, uint16_t **out,
++    size_t *out_len)
++{
++    char *tmp = NULL;
++    char *cursor = NULL;
++    size_t count = 0;
++    uint16_t *parsed = NULL;
++
++    tmp = OPENSSL_strdup(value);
++    if (tmp == NULL)
++        return 0;
++
++    for (cursor = strtok(tmp, ","); cursor != NULL; cursor = strtok(NULL, ",")) {
++        count++;
++    }
++    OPENSSL_free(tmp);
++
++    if (count == 0) {
++        *out = NULL;
++        *out_len = 0;
++        return 1;
++    }
++
++    parsed = OPENSSL_malloc_array(count, sizeof(*parsed));
++    tmp = OPENSSL_strdup(value);
++    if (parsed == NULL || tmp == NULL)
++        goto err;
++
++    count = 0;
++    for (cursor = strtok(tmp, ","); cursor != NULL; cursor = strtok(NULL, ",")) {
++        char *end = NULL;
++        unsigned long item;
++        char *trimmed = ossl_ja4_trim(cursor);
++
++        item = strtoul(trimmed, &end, 0);
++        if (end == NULL || *end != '\0' || item > 0xffffUL)
++            goto err;
++        parsed[count++] = (uint16_t)item;
++    }
++
++    OPENSSL_free(tmp);
++    *out = parsed;
++    *out_len = count;
++    return 1;
++err:
++    OPENSSL_free(parsed);
++    OPENSSL_free(tmp);
++    return 0;
++}
++
++static int ossl_ja4_parse_csv_u8(const char *value, unsigned char **out,
++    size_t *out_len)
++{
++    char *tmp = NULL;
++    char *cursor = NULL;
++    size_t count = 0;
++    unsigned char *parsed = NULL;
++
++    tmp = OPENSSL_strdup(value);
++    if (tmp == NULL)
++        return 0;
++
++    for (cursor = strtok(tmp, ","); cursor != NULL; cursor = strtok(NULL, ",")) {
++        count++;
++    }
++    OPENSSL_free(tmp);
++
++    if (count == 0) {
++        *out = NULL;
++        *out_len = 0;
++        return 1;
++    }
++
++    parsed = OPENSSL_malloc_array(count, sizeof(*parsed));
++    tmp = OPENSSL_strdup(value);
++    if (parsed == NULL || tmp == NULL)
++        goto err;
++
++    count = 0;
++    for (cursor = strtok(tmp, ","); cursor != NULL; cursor = strtok(NULL, ",")) {
++        char *end = NULL;
++        unsigned long item;
++        char *trimmed = ossl_ja4_trim(cursor);
++
++        item = strtoul(trimmed, &end, 0);
++        if (end == NULL || *end != '\0' || item > 0xffUL)
++            goto err;
++        parsed[count++] = (unsigned char)item;
++    }
++
++    OPENSSL_free(tmp);
++    *out = parsed;
++    *out_len = count;
++    return 1;
++err:
++    OPENSSL_free(parsed);
++    OPENSSL_free(tmp);
++    return 0;
++}
++
++static int ossl_ja4_parse_alpn_wire(const char *value, unsigned char **out,
++    size_t *out_len)
++{
++    char *tmp = NULL;
++    char *cursor = NULL;
++    size_t total = 0;
++    unsigned char *wire = NULL;
++    unsigned char *p = NULL;
++
++    tmp = OPENSSL_strdup(value);
++    if (tmp == NULL)
++        return 0;
++
++    for (cursor = strtok(tmp, ","); cursor != NULL; cursor = strtok(NULL, ",")) {
++        size_t token_len = strlen(ossl_ja4_trim(cursor));
++
++        if (token_len == 0 || token_len > 255)
++            goto err;
++        total += token_len + 1;
++    }
++
++    wire = OPENSSL_malloc(total == 0 ? 1 : total);
++    OPENSSL_free(tmp);
++    tmp = OPENSSL_strdup(value);
++    if (wire == NULL || tmp == NULL)
++        goto err;
++
++    p = wire;
++    for (cursor = strtok(tmp, ","); cursor != NULL; cursor = strtok(NULL, ",")) {
++        size_t token_len;
++        char *trimmed = ossl_ja4_trim(cursor);
++
++        token_len = strlen(trimmed);
++        *p++ = (unsigned char)token_len;
++        memcpy(p, trimmed, token_len);
++        p += token_len;
++    }
++
++    OPENSSL_free(tmp);
++    *out = wire;
++    *out_len = total;
++    return 1;
++err:
++    OPENSSL_free(wire);
++    OPENSSL_free(tmp);
++    return 0;
++}
++
++static int ossl_ja4_append_u16(uint16_t **vals, size_t *vals_len, uint16_t value)
++{
++    uint16_t *next = OPENSSL_realloc(*vals, (*vals_len + 1) * sizeof(*next));
++
++    if (next == NULL)
++        return 0;
++    next[*vals_len] = value;
++    *vals = next;
++    (*vals_len)++;
++    return 1;
++}
++
++static int ossl_ja4_contains_u16(const uint16_t *vals, size_t vals_len,
++    uint16_t value)
++{
++    size_t i;
++
++    for (i = 0; i < vals_len; i++) {
++        if (vals[i] == value)
++            return 1;
++    }
++    return 0;
++}
++
++static int ossl_ja4_insert_u16_at(uint16_t **vals, size_t *vals_len,
++    size_t index, uint16_t value)
++{
++    uint16_t *next;
++
++    if (index > *vals_len)
++        index = *vals_len;
++
++    next = OPENSSL_realloc(*vals, (*vals_len + 1) * sizeof(*next));
++    if (next == NULL)
++        return 0;
++
++    if (index < *vals_len) {
++        memmove(&next[index + 1], &next[index],
++            (*vals_len - index) * sizeof(*next));
++    }
++
++    next[index] = value;
++    *vals = next;
++    (*vals_len)++;
++    return 1;
++}
++
++static int ossl_ja4_normalize_extension_order(void)
++{
++    OSSL_JA4_CONFIG *cfg = &ossl_ja4_state.config;
++    size_t i;
++    size_t insert_pos;
++
++    if (cfg->extension_mode != OSSL_JA4_MODE_EXACT_VAL
++        || cfg->extension_order_len == 0) {
++        return 1;
++    }
++
++    /*
++     * JA4 extension lists often omit SNI (0) and ALPN (16). In strict exact
++     * mode that omission can make browser-style replays fail. Normalize the
++     * configured order so these protocol-critical extensions are present when
++     * their corresponding features are enabled.
++     */
++    if (cfg->sni_mode != OSSL_JA4_SNI_NONE
++        && cfg->sni_mode != OSSL_JA4_SNI_IP
++        && !ossl_ja4_contains_u16(cfg->extension_order,
++            cfg->extension_order_len, TLSEXT_TYPE_server_name)) {
++        if (!ossl_ja4_insert_u16_at(&cfg->extension_order,
++                &cfg->extension_order_len, 0, TLSEXT_TYPE_server_name)) {
++            return 0;
++        }
++    }
++
++    if (cfg->alpn_wire != NULL && cfg->alpn_wire_len > 0
++        && !ossl_ja4_contains_u16(cfg->extension_order,
++            cfg->extension_order_len, TLSEXT_TYPE_application_layer_protocol_negotiation)) {
++        insert_pos = cfg->extension_order_len;
++        for (i = 0; i < cfg->extension_order_len; i++) {
++            if (cfg->extension_order[i] == TLSEXT_TYPE_signature_algorithms) {
++                insert_pos = i + 1;
++                break;
++            }
++        }
++        if (!ossl_ja4_insert_u16_at(&cfg->extension_order,
++                &cfg->extension_order_len, insert_pos,
++                TLSEXT_TYPE_application_layer_protocol_negotiation)) {
++            return 0;
++        }
++    }
++
++    /*
++     * Phase 2 dependency closure: when a value-bearing config knob is set
++     * (sigalgs, supported_groups, key_share_groups, supported_versions,
++     * psk_key_exchange_modes) but the user-supplied extension_order omits
++     * the matching extension type, silently auto-inject it at the tail. The
++     * apply path emits the new entry, so finalize_mismatches sees it in
++     * final_extension_order and the 0x0400 drift bit stays clear.
++     */
++    if (cfg->signature_algorithms_len > 0
++        && !ossl_ja4_contains_u16(cfg->extension_order,
++            cfg->extension_order_len, TLSEXT_TYPE_signature_algorithms)) {
++        if (!ossl_ja4_insert_u16_at(&cfg->extension_order,
++                &cfg->extension_order_len, cfg->extension_order_len,
++                TLSEXT_TYPE_signature_algorithms)) {
++            return 0;
++        }
++    }
++
++    if (cfg->supported_groups_len > 0
++        && !ossl_ja4_contains_u16(cfg->extension_order,
++            cfg->extension_order_len, TLSEXT_TYPE_supported_groups)) {
++        if (!ossl_ja4_insert_u16_at(&cfg->extension_order,
++                &cfg->extension_order_len, cfg->extension_order_len,
++                TLSEXT_TYPE_supported_groups)) {
++            return 0;
++        }
++    }
++
++    if (cfg->key_share_groups_len > 0
++        && !ossl_ja4_contains_u16(cfg->extension_order,
++            cfg->extension_order_len, TLSEXT_TYPE_key_share)) {
++        if (!ossl_ja4_insert_u16_at(&cfg->extension_order,
++                &cfg->extension_order_len, cfg->extension_order_len,
++                TLSEXT_TYPE_key_share)) {
++            return 0;
++        }
++    }
++
++    if (cfg->supported_versions_len > 0
++        && !ossl_ja4_contains_u16(cfg->extension_order,
++            cfg->extension_order_len, TLSEXT_TYPE_supported_versions)) {
++        if (!ossl_ja4_insert_u16_at(&cfg->extension_order,
++                &cfg->extension_order_len, cfg->extension_order_len,
++                TLSEXT_TYPE_supported_versions)) {
++            return 0;
++        }
++    }
++
++    if (cfg->psk_key_exchange_modes_len > 0
++        && !ossl_ja4_contains_u16(cfg->extension_order,
++            cfg->extension_order_len, TLSEXT_TYPE_psk_kex_modes)) {
++        if (!ossl_ja4_insert_u16_at(&cfg->extension_order,
++                &cfg->extension_order_len, cfg->extension_order_len,
++                TLSEXT_TYPE_psk_kex_modes)) {
++            return 0;
++        }
++    }
++
++    return 1;
++}
++
++static void ossl_ja4_parse_file(const char *path)
++{
++    FILE *fp = NULL;
++    char line[4096];
++
++    fp = fopen(path, "r");
++    if (fp == NULL)
++        return;
++
++    while (fgets(line, sizeof(line), fp) != NULL) {
++        char *eq;
++        char *key;
++        char *value;
++
++        key = ossl_ja4_trim(line);
++        if (*key == '\0' || *key == '#')
++            continue;
++
++        eq = strchr(key, '=');
++        if (eq == NULL)
++            continue;
++        *eq = '\0';
++        value = ossl_ja4_trim(eq + 1);
++        key = ossl_ja4_trim(key);
++
++        if (strcmp(key, "strict") == 0) {
++            int parsed;
++
++            if (ossl_ja4_parse_bool(value, &parsed)) {
++                ossl_ja4_state.config.strict_set = 1;
++                ossl_ja4_state.config.strict_enabled = parsed;
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "tls_min") == 0) {
++            int parsed;
++
++            if (ossl_ja4_parse_tls_version(value, &parsed)) {
++                ossl_ja4_state.config.tls_min = parsed;
++                ossl_ja4_state.config.tls_min_set = 1;
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "tls_max") == 0) {
++            int parsed;
++
++            if (ossl_ja4_parse_tls_version(value, &parsed)) {
++                ossl_ja4_state.config.tls_max = parsed;
++                ossl_ja4_state.config.tls_max_set = 1;
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "cipher_suites") == 0) {
++            OPENSSL_free(ossl_ja4_state.config.cipher_suites);
++            if (ossl_ja4_parse_csv_u16(value,
++                    &ossl_ja4_state.config.cipher_suites,
++                    &ossl_ja4_state.config.cipher_suites_len)) {
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "cipher_mode") == 0) {
++            if (ossl_ja4_parse_mode(value, &ossl_ja4_state.config.cipher_mode))
++                ossl_ja4_state.config.active = 1;
++        } else if (strcmp(key, "alpn") == 0) {
++            OPENSSL_free(ossl_ja4_state.config.alpn_wire);
++            if (ossl_ja4_parse_alpn_wire(value,
++                    &ossl_ja4_state.config.alpn_wire,
++                    &ossl_ja4_state.config.alpn_wire_len)) {
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "signature_algorithms") == 0) {
++            OPENSSL_free(ossl_ja4_state.config.signature_algorithms);
++            if (ossl_ja4_parse_csv_u16(value,
++                    &ossl_ja4_state.config.signature_algorithms,
++                    &ossl_ja4_state.config.signature_algorithms_len)) {
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "supported_versions") == 0) {
++            OPENSSL_free(ossl_ja4_state.config.supported_versions);
++            if (ossl_ja4_parse_csv_u16(value,
++                    &ossl_ja4_state.config.supported_versions,
++                    &ossl_ja4_state.config.supported_versions_len)) {
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "supported_groups") == 0) {
++            OPENSSL_free(ossl_ja4_state.config.supported_groups);
++            if (ossl_ja4_parse_csv_u16(value,
++                    &ossl_ja4_state.config.supported_groups,
++                    &ossl_ja4_state.config.supported_groups_len)) {
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "key_share_groups") == 0) {
++            OPENSSL_free(ossl_ja4_state.config.key_share_groups);
++            if (ossl_ja4_parse_csv_u16(value,
++                    &ossl_ja4_state.config.key_share_groups,
++                    &ossl_ja4_state.config.key_share_groups_len)) {
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "psk_key_exchange_modes") == 0) {
++            OPENSSL_free(ossl_ja4_state.config.psk_key_exchange_modes);
++            if (ossl_ja4_parse_csv_u8(value,
++                    &ossl_ja4_state.config.psk_key_exchange_modes,
++                    &ossl_ja4_state.config.psk_key_exchange_modes_len)) {
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "extension_order") == 0) {
++            OPENSSL_free(ossl_ja4_state.config.extension_order);
++            if (ossl_ja4_parse_csv_u16(value,
++                    &ossl_ja4_state.config.extension_order,
++                    &ossl_ja4_state.config.extension_order_len)) {
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "extension_mode") == 0) {
++            if (ossl_ja4_parse_mode(value, &ossl_ja4_state.config.extension_mode))
++                ossl_ja4_state.config.active = 1;
++        } else if (strcmp(key, "sni_mode") == 0) {
++            if (ossl_ja4_parse_sni_mode(value, &ossl_ja4_state.config.sni_mode))
++                ossl_ja4_state.config.active = 1;
++        } else if (strcmp(key, "enable_grease") == 0) {
++            int parsed;
++
++            if (ossl_ja4_parse_bool(value, &parsed)) {
++                ossl_ja4_state.config.grease_set = 1;
++                ossl_ja4_state.config.grease_enabled = parsed;
++                ossl_ja4_state.config.active = 1;
++            }
++        } else if (strcmp(key, "grease_value") == 0) {
++            unsigned long parsed_ul;
++            char *endptr = NULL;
++
++            errno = 0;
++            parsed_ul = strtoul(value, &endptr, 0);
++            if (errno == 0 && endptr != value && *endptr == '\0'
++                && parsed_ul <= 0xFFFFu) {
++                ossl_ja4_state.config.grease_value = (uint16_t)parsed_ul;
++                ossl_ja4_state.config.grease_value_set = 1;
++                ossl_ja4_state.config.active = 1;
++            } else {
++                ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_INVALID_CONFIG;
++            }
++        } else if (strcmp(key, "enable_ch_xtn_permutation") == 0) {
++            int parsed;
++
++            if (ossl_ja4_parse_bool(value, &parsed)) {
++                ossl_ja4_state.config.enable_ch_xtn_permutation = parsed;
++                ossl_ja4_state.config.enable_ch_xtn_permutation_set = 1;
++                ossl_ja4_state.config.active = 1;
++                /*
++                 * Real permutation now happens in
++                 * ossl_ja4_rewrite_client_hello_wire via
++                 * ossl_ja4_permute_extensions_inplace; no parser-side
++                 * mismatch raise. If the in-place reorder fails at runtime
++                 * (parse error or OOM) the wire-rewrite path raises
++                 * OSSL_JA4_MISMATCH_INVALID_CONFIG and strict mode aborts.
++                 */
++            }
++        } else {
++            ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_UNKNOWN_KEY;
++        }
++    }
++
++    fclose(fp);
++}
++
++static uint16_t ossl_ja4_pick_grease_value(void)
++{
++    unsigned char r = 0;
++
++    if (RAND_bytes(&r, sizeof(r)) <= 0)
++        return ossl_ja4_grease_values[0];
++    return ossl_ja4_grease_values[r & 0x0f];
++}
++
++int ossl_ja4_prepare_client_hello(SSL_CONNECTION *s)
++{
++    const char *config_path = ossl_safe_getenv("OPENSSL_JA4_CONFIG");
++    uint16_t *groups_dup = NULL;
++    size_t *tuples_dup = NULL;
++    uint16_t *keyshares_dup = NULL;
++
++    ossl_ja4_reset_state();
++    if (config_path == NULL || *config_path == '\0')
++        return 1;
++
++    ossl_ja4_parse_file(config_path);
++    if (!ossl_ja4_state.config.active)
++        return 1;
++    if (!ossl_ja4_normalize_extension_order())
++        return 0;
++
++    if (ossl_ja4_state.config.grease_set
++        && ossl_ja4_state.config.grease_enabled
++        && !ossl_ja4_state.config.grease_value_set) {
++        ossl_ja4_state.config.grease_value = ossl_ja4_pick_grease_value();
++        ossl_ja4_state.config.grease_value_set = 1;
++    }
++
++    if (ossl_ja4_state.config.tls_min_set)
++        s->min_proto_version = ossl_ja4_state.config.tls_min;
++    if (ossl_ja4_state.config.tls_max_set)
++        s->max_proto_version = ossl_ja4_state.config.tls_max;
++    if (ossl_ja4_state.config.alpn_wire != NULL) {
++        unsigned char *dup = OPENSSL_memdup(ossl_ja4_state.config.alpn_wire,
++            ossl_ja4_state.config.alpn_wire_len);
++
++        if (dup == NULL)
++            return 0;
++        OPENSSL_free(s->ext.alpn);
++        s->ext.alpn = dup;
++        s->ext.alpn_len = ossl_ja4_state.config.alpn_wire_len;
++    }
++    if (ossl_ja4_state.config.signature_algorithms_len > 0
++        && !tls1_set_raw_sigalgs(s->cert,
++            ossl_ja4_state.config.signature_algorithms,
++            ossl_ja4_state.config.signature_algorithms_len, 0)) {
++        goto err;
++    }
++    if (ossl_ja4_state.config.supported_groups_len > 0) {
++        groups_dup = OPENSSL_memdup(ossl_ja4_state.config.supported_groups,
++            ossl_ja4_state.config.supported_groups_len * sizeof(*groups_dup));
++        tuples_dup = OPENSSL_malloc(sizeof(*tuples_dup));
++        if (groups_dup == NULL || tuples_dup == NULL)
++            goto err;
++        tuples_dup[0] = ossl_ja4_state.config.supported_groups_len;
++        OPENSSL_free(s->ext.supportedgroups);
++        OPENSSL_free(s->ext.tuples);
++        s->ext.supportedgroups = groups_dup;
++        s->ext.supportedgroups_len = ossl_ja4_state.config.supported_groups_len;
++        s->ext.tuples = tuples_dup;
++        s->ext.tuples_len = 1;
++        groups_dup = NULL;
++        tuples_dup = NULL;
++    }
++    if (ossl_ja4_state.config.key_share_groups_len > 0) {
++        keyshares_dup = OPENSSL_memdup(ossl_ja4_state.config.key_share_groups,
++            ossl_ja4_state.config.key_share_groups_len * sizeof(*keyshares_dup));
++        if (keyshares_dup == NULL)
++            goto err;
++        OPENSSL_free(s->ext.keyshares);
++        s->ext.keyshares = keyshares_dup;
++        s->ext.keyshares_len = ossl_ja4_state.config.key_share_groups_len;
++        keyshares_dup = NULL;
++    }
++
++    return 1;
++err:
++    OPENSSL_free(groups_dup);
++    OPENSSL_free(tuples_dup);
++    OPENSSL_free(keyshares_dup);
++    return 0;
++}
++
++int ossl_ja4_get_cipher_override(const uint16_t **cipher_suites,
++    size_t *cipher_suites_len, int *cipher_mode)
++{
++    if (!ossl_ja4_state.config.active
++        || ossl_ja4_state.config.cipher_suites_len == 0) {
++        return 0;
++    }
++
++    *cipher_suites = ossl_ja4_state.config.cipher_suites;
++    *cipher_suites_len = ossl_ja4_state.config.cipher_suites_len;
++    *cipher_mode = (int)ossl_ja4_state.config.cipher_mode;
++    return 1;
++}
++
++int ossl_ja4_get_alpn_override(const unsigned char **alpn_wire,
++    size_t *alpn_wire_len)
++{
++    if (!ossl_ja4_state.config.active || ossl_ja4_state.config.alpn_wire == NULL)
++        return 0;
++
++    *alpn_wire = ossl_ja4_state.config.alpn_wire;
++    *alpn_wire_len = ossl_ja4_state.config.alpn_wire_len;
++    return 1;
++}
++
++int ossl_ja4_get_sigalg_override(const uint16_t **sigalgs, size_t *sigalgs_len)
++{
++    if (!ossl_ja4_state.config.active
++        || ossl_ja4_state.config.signature_algorithms_len == 0) {
++        return 0;
++    }
++
++    *sigalgs = ossl_ja4_state.config.signature_algorithms;
++    *sigalgs_len = ossl_ja4_state.config.signature_algorithms_len;
++    return 1;
++}
++
++int ossl_ja4_get_supported_versions_override(const uint16_t **versions,
++    size_t *versions_len)
++{
++    if (!ossl_ja4_state.config.active
++        || ossl_ja4_state.config.supported_versions_len == 0) {
++        return 0;
++    }
++
++    *versions = ossl_ja4_state.config.supported_versions;
++    *versions_len = ossl_ja4_state.config.supported_versions_len;
++    return 1;
++}
++
++int ossl_ja4_get_supported_groups_override(const uint16_t **groups,
++    size_t *groups_len)
++{
++    if (!ossl_ja4_state.config.active
++        || ossl_ja4_state.config.supported_groups_len == 0) {
++        return 0;
++    }
++
++    *groups = ossl_ja4_state.config.supported_groups;
++    *groups_len = ossl_ja4_state.config.supported_groups_len;
++    return 1;
++}
++
++int ossl_ja4_get_keyshare_groups_override(const uint16_t **groups,
++    size_t *groups_len)
++{
++    if (!ossl_ja4_state.config.active
++        || ossl_ja4_state.config.key_share_groups_len == 0) {
++        return 0;
++    }
++
++    *groups = ossl_ja4_state.config.key_share_groups;
++    *groups_len = ossl_ja4_state.config.key_share_groups_len;
++    return 1;
++}
++
++int ossl_ja4_get_psk_modes_override(const unsigned char **modes,
++    size_t *modes_len)
++{
++    if (!ossl_ja4_state.config.active
++        || ossl_ja4_state.config.psk_key_exchange_modes_len == 0) {
++        return 0;
++    }
++
++    *modes = ossl_ja4_state.config.psk_key_exchange_modes;
++    *modes_len = ossl_ja4_state.config.psk_key_exchange_modes_len;
++    return 1;
++}
++
++int ossl_ja4_get_extension_override(const uint16_t **extension_order,
++    size_t *extension_order_len, int *extension_mode)
++{
++    if (!ossl_ja4_state.config.active
++        || ossl_ja4_state.config.extension_order_len == 0) {
++        return 0;
++    }
++
++    *extension_order = ossl_ja4_state.config.extension_order;
++    *extension_order_len = ossl_ja4_state.config.extension_order_len;
++    *extension_mode = (int)ossl_ja4_state.config.extension_mode;
++    return 1;
++}
++
++int ossl_ja4_should_suppress_sni(void)
++{
++    return ossl_ja4_state.config.active
++        && (ossl_ja4_state.config.sni_mode == OSSL_JA4_SNI_NONE
++            || ossl_ja4_state.config.sni_mode == OSSL_JA4_SNI_IP);
++}
++
++int ossl_ja4_is_strict_enabled(void)
++{
++    return ossl_ja4_state.config.active
++        && ossl_ja4_state.config.strict_set
++        && ossl_ja4_state.config.strict_enabled;
++}
++
++int ossl_ja4_get_grease_value(uint16_t *grease_value)
++{
++    if (grease_value == NULL)
++        return 0;
++    if (!ossl_ja4_state.config.active
++        || !ossl_ja4_state.config.grease_set
++        || !ossl_ja4_state.config.grease_enabled
++        || !ossl_ja4_state.config.grease_value_set) {
++        return 0;
++    }
++
++    *grease_value = ossl_ja4_state.config.grease_value;
++    return 1;
++}
++
++int ossl_ja4_has_extension_override(void)
++{
++    return ossl_ja4_state.config.active
++        && ossl_ja4_state.config.extension_order_len > 0;
++}
++
++int ossl_ja4_extension_requested(unsigned int type)
++{
++    size_t i;
++
++    if (!ossl_ja4_has_extension_override())
++        return 0;
++
++    for (i = 0; i < ossl_ja4_state.config.extension_order_len; i++) {
++        if (ossl_ja4_state.config.extension_order[i] == type)
++            return 1;
++    }
++    return 0;
++}
++
++void ossl_ja4_note_cipher(uint16_t cipher_id)
++{
++    ossl_ja4_append_u16(&ossl_ja4_state.final_cipher_suites,
++        &ossl_ja4_state.final_cipher_suites_len, cipher_id);
++}
++
++void ossl_ja4_note_extension(uint16_t extension_type)
++{
++    ossl_ja4_append_u16(&ossl_ja4_state.final_extensions,
++        &ossl_ja4_state.final_extensions_len, extension_type);
++}
++
++void ossl_ja4_note_signature_algorithm(uint16_t sigalg_id)
++{
++    ossl_ja4_append_u16(&ossl_ja4_state.final_signature_algorithms,
++        &ossl_ja4_state.final_signature_algorithms_len, sigalg_id);
++}
++
++void ossl_ja4_note_supported_version(uint16_t version)
++{
++    ossl_ja4_append_u16(&ossl_ja4_state.final_supported_versions,
++        &ossl_ja4_state.final_supported_versions_len, version);
++}
++
++void ossl_ja4_note_supported_group(uint16_t group_id)
++{
++    ossl_ja4_append_u16(&ossl_ja4_state.final_supported_groups,
++        &ossl_ja4_state.final_supported_groups_len, group_id);
++}
++
++void ossl_ja4_note_keyshare_group(uint16_t group_id)
++{
++    ossl_ja4_append_u16(&ossl_ja4_state.final_key_share_groups,
++        &ossl_ja4_state.final_key_share_groups_len, group_id);
++}
++
++void ossl_ja4_note_psk_mode(unsigned char mode)
++{
++    unsigned char *next = OPENSSL_realloc(
++        ossl_ja4_state.final_psk_key_exchange_modes,
++        (ossl_ja4_state.final_psk_key_exchange_modes_len + 1) * sizeof(*next));
++
++    if (next == NULL)
++        return;
++    next[ossl_ja4_state.final_psk_key_exchange_modes_len] = mode;
++    ossl_ja4_state.final_psk_key_exchange_modes = next;
++    ossl_ja4_state.final_psk_key_exchange_modes_len++;
++}
++
++static void ossl_ja4_write_csv_u16(FILE *fp, const char *key,
++    const uint16_t *vals, size_t vals_len)
++{
++    size_t i;
++
++    fprintf(fp, "%s=", key);
++    for (i = 0; i < vals_len; i++) {
++        if (i > 0)
++            fputc(',', fp);
++        fprintf(fp, "%u", vals[i]);
++    }
++    fputc('\n', fp);
++}
++
++static void ossl_ja4_write_csv_u8(FILE *fp, const char *key,
++    const unsigned char *vals, size_t vals_len)
++{
++    size_t i;
++
++    fprintf(fp, "%s=", key);
++    for (i = 0; i < vals_len; i++) {
++        if (i > 0)
++            fputc(',', fp);
++        fprintf(fp, "%u", vals[i]);
++    }
++    fputc('\n', fp);
++}
++
++static void ossl_ja4_write_csv_alpn(FILE *fp, const char *key,
++    const unsigned char *wire, size_t wire_len)
++{
++    size_t pos = 0;
++    int first = 1;
++
++    fprintf(fp, "%s=", key);
++    while (pos < wire_len) {
++        size_t token_len = wire[pos++];
++
++        if (pos + token_len > wire_len)
++            break;
++        if (!first)
++            fputc(',', fp);
++        fwrite(wire + pos, 1, token_len, fp);
++        pos += token_len;
++        first = 0;
++    }
++    fputc('\n', fp);
++}
++
++static int ossl_ja4_lists_equal_u16(const uint16_t *req, size_t req_len,
++    const uint16_t *fin, size_t fin_len)
++{
++    size_t i;
++
++    if (req_len != fin_len)
++        return 0;
++    for (i = 0; i < req_len; i++) {
++        if (req[i] != fin[i])
++            return 0;
++    }
++    return 1;
++}
++
++/*
++ * Equality with tolerance for a single trailing GREASE entry on the final
++ * side. With enable_grease=1, OpenSSL appends one GREASE value (e.g. to
++ * signature_algorithms) which is intentional — not a mismatch.
++ */
++static int ossl_ja4_lists_equal_u16_with_trailing_grease(const uint16_t *req,
++    size_t req_len, const uint16_t *fin, size_t fin_len)
++{
++    uint16_t grease;
++
++    if (ossl_ja4_lists_equal_u16(req, req_len, fin, fin_len))
++        return 1;
++    if (!ossl_ja4_state.config.grease_enabled
++        || !ossl_ja4_get_grease_value(&grease))
++        return 0;
++    if (fin_len != req_len + 1)
++        return 0;
++    if (fin[fin_len - 1] != grease)
++        return 0;
++    return ossl_ja4_lists_equal_u16(req, req_len, fin, req_len);
++}
++
++static int ossl_ja4_lists_equal_u8(const unsigned char *req, size_t req_len,
++    const unsigned char *fin, size_t fin_len)
++{
++    size_t i;
++
++    if (req_len != fin_len)
++        return 0;
++    for (i = 0; i < req_len; i++) {
++        if (req[i] != fin[i])
++            return 0;
++    }
++    return 1;
++}
++
++/*
++ * Strip a trailing PSK-pre_shared_key (41) entry before comparing the
++ * extension order. JA4-style canonicalization treats the PSK extension as
++ * "always-last" and excludes it from the requested order.
++ */
++static size_t ossl_ja4_extension_compare_len(const uint16_t *vals, size_t len)
++{
++    if (len > 0 && vals[len - 1] == TLSEXT_TYPE_psk)
++        return len - 1;
++    return len;
++}
++
++static int ossl_ja4_alpn_wire_equal(const unsigned char *req, size_t req_len,
++    const unsigned char *fin, size_t fin_len)
++{
++    if (req_len != fin_len)
++        return 0;
++    if (req_len == 0)
++        return 1;
++    return memcmp(req, fin, req_len) == 0;
++}
++
++/*
++ * Wire-emission validation: in extension_mode=exact, every requested
++ * extension type must actually appear in the post-construct extension list
++ * collected from the WPACKET. Anything missing raises 0x0040
++ * (missing_requested_extension). This runs before finalize_mismatches'
++ * apply_ok latch so a missed extension correctly clears apply_ok.
++ */
++static void ossl_ja4_validate_emitted_extensions(void)
++{
++    OSSL_JA4_CONFIG *cfg = &ossl_ja4_state.config;
++    size_t i;
++
++    if (!cfg->active)
++        return;
++    if (cfg->extension_mode != OSSL_JA4_MODE_EXACT_VAL)
++        return;
++    if (cfg->extension_order_len == 0)
++        return;
++
++    for (i = 0; i < cfg->extension_order_len; i++) {
++        if (!ossl_ja4_contains_u16(ossl_ja4_state.final_extensions,
++                ossl_ja4_state.final_extensions_len,
++                cfg->extension_order[i])) {
++            ossl_ja4_state.mismatch_mask
++                |= OSSL_JA4_MISMATCH_MISSING_EXTENSION;
++            break;
++        }
++    }
++}
++
++static void ossl_ja4_finalize_mismatches(void)
++{
++    OSSL_JA4_CONFIG *cfg = &ossl_ja4_state.config;
++
++    ossl_ja4_validate_emitted_extensions();
++
++    /* ossl_ja4_note_cipher_suites drift -> 0x0080 */
++    if (cfg->cipher_suites_len > 0
++        && !ossl_ja4_lists_equal_u16(cfg->cipher_suites, cfg->cipher_suites_len,
++            ossl_ja4_state.final_cipher_suites,
++            ossl_ja4_state.final_cipher_suites_len)) {
++        ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_CIPHER_SUITES;
++    }
++
++    /* ossl_ja4_note_alpn drift -> 0x0100 */
++    if (cfg->alpn_wire != NULL && cfg->alpn_wire_len > 0
++        && !ossl_ja4_alpn_wire_equal(cfg->alpn_wire, cfg->alpn_wire_len,
++            cfg->alpn_wire, cfg->alpn_wire_len)) {
++        ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_ALPN;
++    }
++
++    /* ossl_ja4_note_signature_algorithms drift -> 0x0200 (GREASE-tolerant) */
++    if (cfg->signature_algorithms_len > 0
++        && !ossl_ja4_lists_equal_u16_with_trailing_grease(
++            cfg->signature_algorithms,
++            cfg->signature_algorithms_len,
++            ossl_ja4_state.final_signature_algorithms,
++            ossl_ja4_state.final_signature_algorithms_len)) {
++        ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_SIGNATURE_ALGORITHMS;
++    }
++
++    /* ossl_ja4_note_extension_order drift -> 0x0400 (modulo PSK-last) */
++    if (cfg->extension_order_len > 0) {
++        size_t req_cmp_len = ossl_ja4_extension_compare_len(cfg->extension_order,
++            cfg->extension_order_len);
++        size_t fin_cmp_len = ossl_ja4_extension_compare_len(
++            ossl_ja4_state.final_extensions,
++            ossl_ja4_state.final_extensions_len);
++
++        if (!ossl_ja4_lists_equal_u16(cfg->extension_order, req_cmp_len,
++                ossl_ja4_state.final_extensions, fin_cmp_len)) {
++            ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_EXTENSION_ORDER;
++        }
++    }
++
++    /* ossl_ja4_note_supported_versions drift -> 0x0008 */
++    if (cfg->supported_versions_len > 0
++        && !ossl_ja4_lists_equal_u16(cfg->supported_versions,
++            cfg->supported_versions_len,
++            ossl_ja4_state.final_supported_versions,
++            ossl_ja4_state.final_supported_versions_len)) {
++        ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_SUPPORTED_VERSIONS;
++    }
++
++    /* ossl_ja4_note_supported_groups drift -> 0x0800 */
++    if (cfg->supported_groups_len > 0
++        && !ossl_ja4_lists_equal_u16(cfg->supported_groups,
++            cfg->supported_groups_len,
++            ossl_ja4_state.final_supported_groups,
++            ossl_ja4_state.final_supported_groups_len)) {
++        ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_SUPPORTED_GROUPS;
++    }
++
++    /* ossl_ja4_note_key_share drift -> 0x0004 */
++    if (cfg->key_share_groups_len > 0
++        && !ossl_ja4_lists_equal_u16(cfg->key_share_groups,
++            cfg->key_share_groups_len,
++            ossl_ja4_state.final_key_share_groups,
++            ossl_ja4_state.final_key_share_groups_len)) {
++        ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_KEY_SHARES;
++    }
++
++    /* ossl_ja4_note_psk_key_exchange_modes drift -> 0x1000 */
++    if (cfg->psk_key_exchange_modes_len > 0
++        && !ossl_ja4_lists_equal_u8(cfg->psk_key_exchange_modes,
++            cfg->psk_key_exchange_modes_len,
++            ossl_ja4_state.final_psk_key_exchange_modes,
++            ossl_ja4_state.final_psk_key_exchange_modes_len)) {
++        ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_PSK_KEX_MODES;
++    }
++
++    ossl_ja4_state.apply_ok = (ossl_ja4_state.mismatch_mask == 0) ? 1 : 0;
++}
++
++int ossl_ja4_get_mismatch_mask(uint32_t *out)
++{
++    if (out == NULL)
++        return 0;
++    *out = ossl_ja4_state.mismatch_mask;
++    return 1;
++}
++
++static const char *ossl_ja4_sni_mode_str(OSSL_JA4_SNI_MODE mode)
++{
++    switch (mode) {
++    case OSSL_JA4_SNI_PRESENT:
++        return "present";
++    case OSSL_JA4_SNI_DOMAIN:
++        return "domain";
++    case OSSL_JA4_SNI_NONE:
++        return "none";
++    case OSSL_JA4_SNI_IP:
++        return "ip";
++    case OSSL_JA4_SNI_UNSET:
++    default:
++        return "present";
++    }
++}
++
++void ossl_ja4_write_dump(SSL_CONNECTION *s)
++{
++    const char *dump_path = ossl_safe_getenv("OPENSSL_JA4_DUMP");
++    FILE *fp = NULL;
++
++    ossl_ja4_finalize_mismatches();
++
++    if (dump_path == NULL || *dump_path == '\0')
++        return;
++
++    fp = fopen(dump_path, "w");
++    if (fp == NULL)
++        return;
++
++    /* Header / Status */
++    fprintf(fp, "active=%d\n", ossl_ja4_state.config.active);
++    fprintf(fp, "apply_ok=%d\n", ossl_ja4_state.apply_ok);
++    fprintf(fp, "mismatch_mask=%u\n",
++        (unsigned int)ossl_ja4_state.mismatch_mask);
++
++    /* Effektive Versionen + Knobs */
++    fprintf(fp, "effective_tls_min=%d\n", s->min_proto_version);
++    fprintf(fp, "effective_tls_max=%d\n", s->max_proto_version);
++    fprintf(fp, "strict=%d\n", ossl_ja4_state.config.strict_enabled);
++    fprintf(fp, "sni_mode=%s\n",
++        ossl_ja4_sni_mode_str(ossl_ja4_state.config.sni_mode));
++    fprintf(fp, "enable_grease=%d\n", ossl_ja4_state.config.grease_enabled);
++    /*
++     * enable_ch_xtn_permutation is part of the v1 schema. OpenSSL has no
++     * native ClientHello extension permutation, so the parser also sets
++     * 0x0020 (invalid_config_combination) when the value is 1. Emit the
++     * configured value (default 0) so the dump round-trips faithfully.
++     */
++    fprintf(fp, "enable_ch_xtn_permutation=%d\n",
++        ossl_ja4_state.config.enable_ch_xtn_permutation);
++    if (ossl_ja4_state.config.grease_enabled
++        && ossl_ja4_state.config.grease_value_set)
++        fprintf(fp, "grease_value=%u\n", ossl_ja4_state.config.grease_value);
++    else
++        fprintf(fp, "grease_value=\n");
++
++    /* requested_* Block */
++    ossl_ja4_write_csv_u16(fp, "requested_cipher_suites",
++        ossl_ja4_state.config.cipher_suites,
++        ossl_ja4_state.config.cipher_suites_len);
++    ossl_ja4_write_csv_alpn(fp, "requested_alpn",
++        ossl_ja4_state.config.alpn_wire,
++        ossl_ja4_state.config.alpn_wire_len);
++    ossl_ja4_write_csv_u16(fp, "requested_signature_algorithms",
++        ossl_ja4_state.config.signature_algorithms,
++        ossl_ja4_state.config.signature_algorithms_len);
++    ossl_ja4_write_csv_u16(fp, "requested_extension_order",
++        ossl_ja4_state.config.extension_order,
++        ossl_ja4_state.config.extension_order_len);
++    ossl_ja4_write_csv_u16(fp, "requested_supported_versions",
++        ossl_ja4_state.config.supported_versions,
++        ossl_ja4_state.config.supported_versions_len);
++    ossl_ja4_write_csv_u16(fp, "requested_supported_groups",
++        ossl_ja4_state.config.supported_groups,
++        ossl_ja4_state.config.supported_groups_len);
++    ossl_ja4_write_csv_u16(fp, "requested_key_share_groups",
++        ossl_ja4_state.config.key_share_groups,
++        ossl_ja4_state.config.key_share_groups_len);
++    ossl_ja4_write_csv_u8(fp, "requested_psk_key_exchange_modes",
++        ossl_ja4_state.config.psk_key_exchange_modes,
++        ossl_ja4_state.config.psk_key_exchange_modes_len);
++
++    /* final_* Block */
++    ossl_ja4_write_csv_u16(fp, "final_cipher_suites",
++        ossl_ja4_state.final_cipher_suites,
++        ossl_ja4_state.final_cipher_suites_len);
++    /* final_alpn is not re-parsed yet (phase 3 task); echo requested */
++    ossl_ja4_write_csv_alpn(fp, "final_alpn",
++        ossl_ja4_state.config.alpn_wire,
++        ossl_ja4_state.config.alpn_wire_len);
++    ossl_ja4_write_csv_u16(fp, "final_signature_algorithms",
++        ossl_ja4_state.final_signature_algorithms,
++        ossl_ja4_state.final_signature_algorithms_len);
++    ossl_ja4_write_csv_u16(fp, "final_extension_order",
++        ossl_ja4_state.final_extensions,
++        ossl_ja4_state.final_extensions_len);
++    ossl_ja4_write_csv_u16(fp, "final_supported_versions",
++        ossl_ja4_state.final_supported_versions,
++        ossl_ja4_state.final_supported_versions_len);
++    ossl_ja4_write_csv_u16(fp, "final_supported_groups",
++        ossl_ja4_state.final_supported_groups,
++        ossl_ja4_state.final_supported_groups_len);
++    ossl_ja4_write_csv_u16(fp, "final_key_share_groups",
++        ossl_ja4_state.final_key_share_groups,
++        ossl_ja4_state.final_key_share_groups_len);
++    ossl_ja4_write_csv_u8(fp, "final_psk_key_exchange_modes",
++        ossl_ja4_state.final_psk_key_exchange_modes,
++        ossl_ja4_state.final_psk_key_exchange_modes_len);
++
++    fclose(fp);
++}
++
++/*
++ * JA4 phase-3 post-serialization wire rewrite.
++ *
++ * Mirrors the NSS helper ssl3_Ja4RewriteTls13ExtensionBodies (patch 0005).
++ * After tls_construct_extensions has finished, the outer u24 ClientHello
++ * length is still open in |pkt| but every inner sub-packet (cipher_suites,
++ * legacy_compression_methods, the u16 extensions block) is closed and its
++ * length-prefix is already written to the underlying buffer. We can therefore
++ * parse the buffer in place, locate the extension list, and rewrite the
++ * bodies of selected extension types byte-for-byte.
++ *
++ * For now this only performs same-size rewrites for three simple lists:
++ *   - supported_versions (0x002b)
++ *   - supported_groups   (0x000a)
++ *   - psk_key_exchange_modes (0x002d)
++ * which keeps the total buffer length stable so we do not have to grow or
++ * shrink the WPACKET. Re-generating key_share entries (0x0033) requires a
++ * regenerated EVP_PKEY per group and is left as a known limit; if a
++ * key_share override is configured but this rewrite path cannot honour it,
++ * OSSL_JA4_MISMATCH_KEY_SHARES is raised so the strict-mode contract still
++ * surfaces the gap.
++ */
++
++#define OSSL_JA4_HEADER_BYTES 4
++
++static int ossl_ja4_wire_extension_offset(const unsigned char *body,
++    size_t body_len, size_t *ext_block_off, size_t *ext_block_len)
++{
++    size_t pos = 0;
++    size_t len;
++
++    /* legacy_version (2) + random (32) */
++    if (body_len < 2 + 32 + 1)
++        return 0;
++    pos = 2 + 32;
++
++    /* session_id <0..32> */
++    len = body[pos];
++    pos++;
++    if (len > 32 || pos + len > body_len)
++        return 0;
++    pos += len;
++
++    /* cipher_suites <2..2^16-2> */
++    if (pos + 2 > body_len)
++        return 0;
++    len = ((size_t)body[pos] << 8) | body[pos + 1];
++    pos += 2;
++    if (pos + len > body_len)
++        return 0;
++    pos += len;
++
++    /* legacy_compression_methods <1..2^8-1> */
++    if (pos + 1 > body_len)
++        return 0;
++    len = body[pos];
++    pos++;
++    if (pos + len > body_len)
++        return 0;
++    pos += len;
++
++    /* extensions <8..2^16-1> -- TLS 1.3 ClientHello must have extensions */
++    if (pos + 2 > body_len)
++        return 0;
++    len = ((size_t)body[pos] << 8) | body[pos + 1];
++    pos += 2;
++    if (pos + len != body_len)
++        return 0;
++
++    *ext_block_off = pos;
++    *ext_block_len = len;
++    return 1;
++}
++
++static int ossl_ja4_wire_find_extension(const unsigned char *block,
++    size_t block_len, uint16_t type, size_t *body_off, size_t *body_len)
++{
++    size_t pos = 0;
++
++    while (pos + 4 <= block_len) {
++        uint16_t this_type = ((uint16_t)block[pos] << 8) | block[pos + 1];
++        size_t this_len = ((size_t)block[pos + 2] << 8) | block[pos + 3];
++
++        if (pos + 4 + this_len > block_len)
++            return 0;
++        if (this_type == type) {
++            *body_off = pos + 4;
++            *body_len = this_len;
++            return 1;
++        }
++        pos += 4 + this_len;
++    }
++    return 0;
++}
++
++static int ossl_ja4_build_supported_versions_body(const OSSL_JA4_CONFIG *cfg,
++    unsigned char *out, size_t cap, size_t *out_len)
++{
++    size_t i;
++    size_t need;
++
++    if (cfg->supported_versions_len == 0)
++        return 0;
++    need = 1 + cfg->supported_versions_len * 2;
++    if (need > cap || cfg->supported_versions_len > 127)
++        return 0;
++    out[0] = (unsigned char)(cfg->supported_versions_len * 2);
++    for (i = 0; i < cfg->supported_versions_len; i++) {
++        out[1 + i * 2] = (unsigned char)(cfg->supported_versions[i] >> 8);
++        out[2 + i * 2] = (unsigned char)(cfg->supported_versions[i] & 0xff);
++    }
++    *out_len = need;
++    return 1;
++}
++
++static int ossl_ja4_build_supported_groups_body(const OSSL_JA4_CONFIG *cfg,
++    unsigned char *out, size_t cap, size_t *out_len)
++{
++    size_t i;
++    size_t list_bytes;
++    size_t need;
++
++    if (cfg->supported_groups_len == 0)
++        return 0;
++    list_bytes = cfg->supported_groups_len * 2;
++    need = 2 + list_bytes;
++    if (need > cap || list_bytes > 0xfffful)
++        return 0;
++    out[0] = (unsigned char)(list_bytes >> 8);
++    out[1] = (unsigned char)(list_bytes & 0xff);
++    for (i = 0; i < cfg->supported_groups_len; i++) {
++        out[2 + i * 2] = (unsigned char)(cfg->supported_groups[i] >> 8);
++        out[3 + i * 2] = (unsigned char)(cfg->supported_groups[i] & 0xff);
++    }
++    *out_len = need;
++    return 1;
++}
++
++static int ossl_ja4_build_psk_modes_body(const OSSL_JA4_CONFIG *cfg,
++    unsigned char *out, size_t cap, size_t *out_len)
++{
++    size_t i;
++    size_t need;
++
++    if (cfg->psk_key_exchange_modes_len == 0)
++        return 0;
++    need = 1 + cfg->psk_key_exchange_modes_len;
++    if (need > cap || cfg->psk_key_exchange_modes_len > 0xff)
++        return 0;
++    out[0] = (unsigned char)cfg->psk_key_exchange_modes_len;
++    for (i = 0; i < cfg->psk_key_exchange_modes_len; i++)
++        out[1 + i] = cfg->psk_key_exchange_modes[i];
++    *out_len = need;
++    return 1;
++}
++
++/*
++ * Replace one extension's body in-place if and only if the new body has the
++ * same size as the old body. Returns 1 if the rewrite happened, 0 if the
++ * extension is missing or the size differs (caller decides how to react).
++ */
++static int ossl_ja4_replace_extension_body_inplace(unsigned char *block,
++    size_t block_len, uint16_t type, const unsigned char *new_body,
++    size_t new_body_len)
++{
++    size_t body_off = 0;
++    size_t body_len = 0;
++
++    if (!ossl_ja4_wire_find_extension(block, block_len, type, &body_off,
++            &body_len))
++        return 0;
++    if (body_len != new_body_len)
++        return 0;
++    if (new_body_len > 0)
++        memcpy(block + body_off, new_body, new_body_len);
++    return 1;
++}
++
++/*
++ * Deterministic ClientHello extension permutation.
++ *
++ * Reorders the entire extension block in place using a Fisher-Yates shuffle
++ * driven by an xorshift32 PRNG seeded from |seed|. Same-size invariant is
++ * preserved (we only move whole (type, len, body) tuples — no body changes).
++ *
++ * RFC 8446 § 4.2.11 requires pre_shared_key (0x0029) to be the last
++ * extension. RFC 8446 § 4.2.10 keeps padding (0x0015) at the very end so it
++ * actually balances the ClientHello size; we treat it as a fixed-tail entry
++ * to avoid breaking any downstream length math (length re-balancing after
++ * permutation is documented as a sub-limit).
++ *
++ * Returns 1 on success, 0 on parse failure / OOM. Block contents are only
++ * touched when the function returns 1.
++ */
++#define OSSL_JA4_PERMUTE_MAX_EXTS 64
++
++typedef struct {
++    uint16_t type;
++    size_t off;
++    size_t total_len;
++} ossl_ja4_ext_entry;
++
++static int ossl_ja4_permute_extensions_inplace(unsigned char *block,
++    size_t block_len, uint32_t seed)
++{
++    ossl_ja4_ext_entry entries[OSSL_JA4_PERMUTE_MAX_EXTS];
++    size_t mid_idx[OSSL_JA4_PERMUTE_MAX_EXTS];
++    size_t tail_idx[2] = {0};
++    size_t n = 0, mid_n = 0, tail_n = 0;
++    size_t pos = 0, out_pos = 0;
++    size_t pad_pos = SIZE_MAX, psk_pos = SIZE_MAX;
++    unsigned char *scratch;
++    uint32_t s;
++    size_t i;
++
++    while (pos + 4 <= block_len) {
++        uint16_t type = ((uint16_t)block[pos] << 8) | block[pos + 1];
++        size_t len = ((size_t)block[pos + 2] << 8) | block[pos + 3];
++
++        if (pos + 4 + len > block_len)
++            return 0;
++        if (n >= OSSL_JA4_PERMUTE_MAX_EXTS)
++            return 0;
++        entries[n].type = type;
++        entries[n].off = pos;
++        entries[n].total_len = 4 + len;
++        if (type == TLSEXT_TYPE_padding)
++            pad_pos = n;
++        else if (type == TLSEXT_TYPE_psk)
++            psk_pos = n;
++        else
++            mid_idx[mid_n++] = n;
++        n++;
++        pos += 4 + len;
++    }
++    if (pos != block_len)
++        return 0;
++    if (n == 0)
++        return 1;
++
++    if (pad_pos != SIZE_MAX)
++        tail_idx[tail_n++] = pad_pos;
++    if (psk_pos != SIZE_MAX)
++        tail_idx[tail_n++] = psk_pos;
++
++    /*
++     * xorshift32. Seed normalisation guarantees a non-zero state so the PRNG
++     * actually produces a sequence — xorshift family stalls on zero.
++     */
++    s = seed;
++    if (s == 0)
++        s = 0x9e3779b9u;
++    s ^= s << 13;
++    s ^= s >> 17;
++    s ^= s << 5;
++
++    for (i = mid_n; i > 1; i--) {
++        size_t j;
++        size_t tmp_v;
++
++        s ^= s << 13;
++        s ^= s >> 17;
++        s ^= s << 5;
++        j = (size_t)(s % (uint32_t)i);
++        tmp_v = mid_idx[i - 1];
++        mid_idx[i - 1] = mid_idx[j];
++        mid_idx[j] = tmp_v;
++    }
++
++    scratch = OPENSSL_malloc(block_len);
++    if (scratch == NULL)
++        return 0;
++
++    for (i = 0; i < mid_n; i++) {
++        size_t src = entries[mid_idx[i]].off;
++        size_t cnt = entries[mid_idx[i]].total_len;
++
++        memcpy(scratch + out_pos, block + src, cnt);
++        out_pos += cnt;
++    }
++    for (i = 0; i < tail_n; i++) {
++        size_t src = entries[tail_idx[i]].off;
++        size_t cnt = entries[tail_idx[i]].total_len;
++
++        memcpy(scratch + out_pos, block + src, cnt);
++        out_pos += cnt;
++    }
++    if (out_pos != block_len) {
++        OPENSSL_free(scratch);
++        return 0;
++    }
++    memcpy(block, scratch, block_len);
++    OPENSSL_free(scratch);
++    return 1;
++}
++
++/*
++ * Mix the configured extension_order list down to a 32-bit seed so that
++ * permutation is reproducible even when grease_value is unset. Uses FNV-1a.
++ */
++static uint32_t ossl_ja4_extension_order_seed(const OSSL_JA4_CONFIG *cfg)
++{
++    uint32_t h = 0x811c9dc5u;
++    size_t i;
++
++    for (i = 0; i < cfg->extension_order_len; i++) {
++        h ^= (uint32_t)(cfg->extension_order[i] >> 8);
++        h *= 0x01000193u;
++        h ^= (uint32_t)(cfg->extension_order[i] & 0xffu);
++        h *= 0x01000193u;
++    }
++    return h;
++}
++
++/*
++ * Re-parse the on-wire bodies for the JA4-tracked TLS 1.3 fields and refresh
++ * the final_* state from the post-rewrite bytes. Mirrors the
++ * ssl3_Ja4SyncXtnDataFromBuffer / ssl_ja4_capture_client_hello path in NSS
++ * and BoringSSL.
++ */
++static void ossl_ja4_recapture_final_lists(const unsigned char *block,
++    size_t block_len)
++{
++    size_t body_off;
++    size_t body_len;
++
++    if (ossl_ja4_wire_find_extension(block, block_len,
++            TLSEXT_TYPE_supported_versions, &body_off, &body_len)
++        && body_len >= 1) {
++        size_t list_bytes = block[body_off];
++
++        if (list_bytes + 1 == body_len && (list_bytes & 1) == 0) {
++            size_t count = list_bytes / 2;
++            size_t i;
++
++            ossl_ja4_reset_dynamic(&ossl_ja4_state.final_supported_versions,
++                &ossl_ja4_state.final_supported_versions_len);
++            for (i = 0; i < count; i++) {
++                uint16_t v = ((uint16_t)block[body_off + 1 + i * 2] << 8)
++                    | block[body_off + 1 + i * 2 + 1];
++                ossl_ja4_append_u16(
++                    &ossl_ja4_state.final_supported_versions,
++                    &ossl_ja4_state.final_supported_versions_len, v);
++            }
++        }
++    }
++
++    if (ossl_ja4_wire_find_extension(block, block_len,
++            TLSEXT_TYPE_supported_groups, &body_off, &body_len)
++        && body_len >= 2) {
++        size_t list_bytes = ((size_t)block[body_off] << 8)
++            | block[body_off + 1];
++
++        if (list_bytes + 2 == body_len && (list_bytes & 1) == 0) {
++            size_t count = list_bytes / 2;
++            size_t i;
++
++            ossl_ja4_reset_dynamic(&ossl_ja4_state.final_supported_groups,
++                &ossl_ja4_state.final_supported_groups_len);
++            for (i = 0; i < count; i++) {
++                uint16_t v = ((uint16_t)block[body_off + 2 + i * 2] << 8)
++                    | block[body_off + 2 + i * 2 + 1];
++                ossl_ja4_append_u16(
++                    &ossl_ja4_state.final_supported_groups,
++                    &ossl_ja4_state.final_supported_groups_len, v);
++            }
++        }
++    }
++
++    if (ossl_ja4_wire_find_extension(block, block_len,
++            TLSEXT_TYPE_psk_kex_modes, &body_off, &body_len)
++        && body_len >= 1) {
++        size_t list_bytes = block[body_off];
++
++        if (list_bytes + 1 == body_len) {
++            size_t i;
++
++            OPENSSL_free(ossl_ja4_state.final_psk_key_exchange_modes);
++            ossl_ja4_state.final_psk_key_exchange_modes = NULL;
++            ossl_ja4_state.final_psk_key_exchange_modes_len = 0;
++            for (i = 0; i < list_bytes; i++)
++                ossl_ja4_note_psk_mode(block[body_off + 1 + i]);
++        }
++    }
++
++    if (ossl_ja4_wire_find_extension(block, block_len,
++            TLSEXT_TYPE_key_share, &body_off, &body_len)
++        && body_len >= 2) {
++        size_t list_bytes = ((size_t)block[body_off] << 8)
++            | block[body_off + 1];
++        size_t pos;
++
++        if (list_bytes + 2 == body_len) {
++            ossl_ja4_reset_dynamic(&ossl_ja4_state.final_key_share_groups,
++                &ossl_ja4_state.final_key_share_groups_len);
++            pos = body_off + 2;
++            while (pos + 4 <= body_off + body_len) {
++                uint16_t group = ((uint16_t)block[pos] << 8) | block[pos + 1];
++                size_t share_len = ((size_t)block[pos + 2] << 8)
++                    | block[pos + 3];
++
++                if (pos + 4 + share_len > body_off + body_len)
++                    break;
++                ossl_ja4_append_u16(
++                    &ossl_ja4_state.final_key_share_groups,
++                    &ossl_ja4_state.final_key_share_groups_len, group);
++                pos += 4 + share_len;
++            }
++        }
++    }
++}
++
++int ossl_ja4_rewrite_client_hello_wire(SSL_CONNECTION *s, WPACKET *pkt)
++{
++    OSSL_JA4_CONFIG *cfg = &ossl_ja4_state.config;
++    size_t total_written = 0;
++    unsigned char *buf;
++    unsigned char *body;
++    size_t body_len;
++    size_t ext_block_off = 0;
++    size_t ext_block_len = 0;
++    unsigned char *block;
++    int strict;
++    unsigned char tmp[1024];
++    size_t tmp_len = 0;
++
++    /* Inactive config: nothing to rewrite, success. */
++    if (!cfg->active)
++        return 1;
++
++    if (pkt == NULL || pkt->buf == NULL || pkt->buf->data == NULL)
++        return 1;
++
++    /*
++     * Make sure every closed sub-packet has its length written to the buffer.
++     * The outer u24 ClientHello sub is still open at this point but its
++     * length is recomputed implicitly from pkt->written - sub->pwritten when
++     * the statem write-loop calls WPACKET_finish, so we do not need to touch
++     * it here.
++     */
++    if (!WPACKET_fill_lengths(pkt))
++        return 1;
++
++    if (!WPACKET_get_total_written(pkt, &total_written))
++        return 1;
++    if (total_written <= OSSL_JA4_HEADER_BYTES)
++        return 1;
++
++    buf = (unsigned char *)pkt->buf->data;
++    body = buf + OSSL_JA4_HEADER_BYTES;
++    body_len = total_written - OSSL_JA4_HEADER_BYTES;
++
++    if (!ossl_ja4_wire_extension_offset(body, body_len, &ext_block_off,
++            &ext_block_len)) {
++        /* Likely TLS 1.2 ClientHello without extensions or malformed. */
++        return 1;
++    }
++
++    block = body + ext_block_off;
++    strict = ossl_ja4_state.config.strict_enabled
++        && ossl_ja4_state.config.strict_set;
++
++    /*
++     * Deterministic extension permutation (Chromium-style). Runs before the
++     * body rewrites so subsequent in-place edits still find their target by
++     * type lookup. Seed prefers the configured grease_value (matches the
++     * other Chromium-style spoofing knobs); if zero, fall back to a hash of
++     * the requested extension_order so the result is reproducible without
++     * GREASE.
++     */
++    if (cfg->enable_ch_xtn_permutation) {
++        uint32_t seed = (uint32_t)cfg->grease_value;
++
++        if (seed == 0)
++            seed = ossl_ja4_extension_order_seed(cfg);
++        if (!ossl_ja4_permute_extensions_inplace(block, ext_block_len,
++                seed)) {
++            ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_INVALID_CONFIG;
++            if (strict)
++                return 0;
++        }
++    }
++
++    if (cfg->supported_versions_len > 0
++        && ossl_ja4_build_supported_versions_body(cfg, tmp, sizeof(tmp),
++            &tmp_len)) {
++        if (!ossl_ja4_replace_extension_body_inplace(block, ext_block_len,
++                TLSEXT_TYPE_supported_versions, tmp, tmp_len)) {
++            /* Length mismatch -> cannot do same-size in-place rewrite. */
++            ossl_ja4_state.mismatch_mask
++                |= OSSL_JA4_MISMATCH_SUPPORTED_VERSIONS;
++            if (strict)
++                return 0;
++        }
++    }
++
++    if (cfg->supported_groups_len > 0
++        && ossl_ja4_build_supported_groups_body(cfg, tmp, sizeof(tmp),
++            &tmp_len)) {
++        if (!ossl_ja4_replace_extension_body_inplace(block, ext_block_len,
++                TLSEXT_TYPE_supported_groups, tmp, tmp_len)) {
++            ossl_ja4_state.mismatch_mask
++                |= OSSL_JA4_MISMATCH_SUPPORTED_GROUPS;
++            if (strict)
++                return 0;
++        }
++    }
++
++    if (cfg->psk_key_exchange_modes_len > 0
++        && ossl_ja4_build_psk_modes_body(cfg, tmp, sizeof(tmp), &tmp_len)) {
++        if (!ossl_ja4_replace_extension_body_inplace(block, ext_block_len,
++                TLSEXT_TYPE_psk_kex_modes, tmp, tmp_len)) {
++            ossl_ja4_state.mismatch_mask
++                |= OSSL_JA4_MISMATCH_PSK_KEX_MODES;
++            if (strict)
++                return 0;
++        }
++    }
++
++    /*
++     * key_share regeneration is a known limit of this iteration: it requires
++     * fresh EVP_PKEY material for each requested group which is non-trivial
++     * to splice in after tls_construct_extensions. If the caller asked for
++     * an explicit key_share_groups override we surface that as
++     * OSSL_JA4_MISMATCH_KEY_SHARES so strict mode rejects the handshake; the
++     * Phase-2 apply path already steered OpenSSL's internal key_share
++     * generation, so most JA4 replays still get the right wire bytes
++     * organically.
++     */
++    if (cfg->key_share_groups_len > 0) {
++        size_t ks_off = 0;
++        size_t ks_len = 0;
++
++        if (!ossl_ja4_wire_find_extension(block, ext_block_len,
++                TLSEXT_TYPE_key_share, &ks_off, &ks_len)) {
++            ossl_ja4_state.mismatch_mask |= OSSL_JA4_MISMATCH_KEY_SHARES;
++            if (strict)
++                return 0;
++        }
++    }
++
++    /* Re-capture final_* lists from the (possibly rewritten) wire bytes. */
++    ossl_ja4_recapture_final_lists(block, ext_block_len);
++
++    return 1;
++}
+diff --git a/ssl/ssl_local.h b/ssl/ssl_local.h
+index 0f6402b2b7..a07de88fa9 100644
+--- a/ssl/ssl_local.h
++++ b/ssl/ssl_local.h
+@@ -2836,6 +2836,52 @@ __owur int tls1_set_raw_sigalgs(CERT *c, const uint16_t *psigs, size_t salglen,
+     int client);
+ __owur int tls1_set_sigalgs(CERT *c, const int *salg, size_t salglen,
+     int client);
++#define OSSL_JA4_MODE_REORDER 1
++#define OSSL_JA4_MODE_EXACT 2
++#define OSSL_JA4_MISMATCH_PARSE                 0x0001u
++#define OSSL_JA4_MISMATCH_APPLY                 0x0002u
++#define OSSL_JA4_MISMATCH_KEY_SHARES            0x0004u
++#define OSSL_JA4_MISMATCH_SUPPORTED_VERSIONS    0x0008u
++#define OSSL_JA4_MISMATCH_UNKNOWN_KEY           0x0010u
++#define OSSL_JA4_MISMATCH_INVALID_CONFIG        0x0020u
++#define OSSL_JA4_MISMATCH_MISSING_EXTENSION     0x0040u
++#define OSSL_JA4_MISMATCH_CIPHER_SUITES         0x0080u
++#define OSSL_JA4_MISMATCH_ALPN                  0x0100u
++#define OSSL_JA4_MISMATCH_SIGNATURE_ALGORITHMS  0x0200u
++#define OSSL_JA4_MISMATCH_EXTENSION_ORDER       0x0400u
++#define OSSL_JA4_MISMATCH_SUPPORTED_GROUPS      0x0800u
++#define OSSL_JA4_MISMATCH_PSK_KEX_MODES         0x1000u
++__owur int ossl_ja4_prepare_client_hello(SSL_CONNECTION *s);
++int ossl_ja4_get_cipher_override(const uint16_t **cipher_suites,
++    size_t *cipher_suites_len, int *cipher_mode);
++int ossl_ja4_get_alpn_override(const unsigned char **alpn_wire,
++    size_t *alpn_wire_len);
++int ossl_ja4_get_sigalg_override(const uint16_t **sigalgs, size_t *sigalgs_len);
++int ossl_ja4_get_supported_versions_override(const uint16_t **versions,
++    size_t *versions_len);
++int ossl_ja4_get_supported_groups_override(const uint16_t **groups,
++    size_t *groups_len);
++int ossl_ja4_get_keyshare_groups_override(const uint16_t **groups,
++    size_t *groups_len);
++int ossl_ja4_get_psk_modes_override(const unsigned char **modes,
++    size_t *modes_len);
++int ossl_ja4_get_extension_override(const uint16_t **extension_order,
++    size_t *extension_order_len, int *extension_mode);
++int ossl_ja4_should_suppress_sni(void);
++int ossl_ja4_is_strict_enabled(void);
++int ossl_ja4_get_grease_value(uint16_t *grease_value);
++int ossl_ja4_has_extension_override(void);
++int ossl_ja4_extension_requested(unsigned int type);
++void ossl_ja4_note_cipher(uint16_t cipher_id);
++void ossl_ja4_note_extension(uint16_t extension_type);
++void ossl_ja4_note_signature_algorithm(uint16_t sigalg_id);
++void ossl_ja4_note_supported_version(uint16_t version);
++void ossl_ja4_note_supported_group(uint16_t group_id);
++void ossl_ja4_note_keyshare_group(uint16_t group_id);
++void ossl_ja4_note_psk_mode(unsigned char mode);
++int ossl_ja4_get_mismatch_mask(uint32_t *out);
++void ossl_ja4_write_dump(SSL_CONNECTION *s);
++int ossl_ja4_rewrite_client_hello_wire(SSL_CONNECTION *s, WPACKET *pkt);
+ int tls1_check_chain(SSL_CONNECTION *s, X509 *x, EVP_PKEY *pk,
+     STACK_OF(X509) *chain, int idx);
+ void tls1_set_cert_validity(SSL_CONNECTION *s);
+diff --git a/ssl/statem/extensions.c b/ssl/statem/extensions.c
+index eae6bae0f7..2ce8059b4c 100644
+--- a/ssl/statem/extensions.c
++++ b/ssl/statem/extensions.c
+@@ -113,6 +113,21 @@ typedef struct extensions_definition_st {
+     int (*final)(SSL_CONNECTION *s, unsigned int context, int sent);
+ } EXTENSION_DEFINITION;
+ 
++static int ja4_exact_should_preserve_extension(SSL_CONNECTION *s,
++    const EXTENSION_DEFINITION *thisexd, unsigned int context, int max_version);
++static EXT_RETURN ja4_construct_synthetic_extension(SSL_CONNECTION *s,
++    WPACKET *pkt, unsigned int type);
++
++#ifndef TLSEXT_TYPE_record_size_limit
++# define TLSEXT_TYPE_record_size_limit 28
++#endif
++#ifndef TLSEXT_TYPE_delegated_credentials
++# define TLSEXT_TYPE_delegated_credentials 34
++#endif
++#ifndef TLSEXT_TYPE_encrypted_client_hello
++# define TLSEXT_TYPE_encrypted_client_hello 65037
++#endif
++
+ /*
+  * Definitions of all built-in extensions. NOTE: Changes in the number or order
+  * of these extensions should be mirrored with equivalent changes to the
+@@ -788,6 +803,89 @@ int should_add_extension(SSL_CONNECTION *s, unsigned int extctx,
+     return 1;
+ }
+ 
++static EXT_RETURN ja4_construct_synthetic_extension(SSL_CONNECTION *s,
++    WPACKET *pkt, unsigned int type)
++{
++    size_t i;
++
++    switch (type) {
++    case TLSEXT_TYPE_delegated_credentials:
++        {
++            const uint16_t *sigalgs = NULL;
++            size_t sigalgs_len = 0;
++
++            if (!ossl_ja4_get_sigalg_override(&sigalgs, &sigalgs_len)
++                || sigalgs_len == 0)
++                return EXT_RETURN_NOT_SENT;
++
++            if (!WPACKET_put_bytes_u16(pkt, type)
++                || !WPACKET_start_sub_packet_u16(pkt)
++                || !WPACKET_start_sub_packet_u16(pkt)) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return EXT_RETURN_FAIL;
++            }
++            for (i = 0; i < sigalgs_len; i++) {
++                if (!WPACKET_put_bytes_u16(pkt, sigalgs[i])) {
++                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                    return EXT_RETURN_FAIL;
++                }
++            }
++            if (!WPACKET_close(pkt) || !WPACKET_close(pkt)) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return EXT_RETURN_FAIL;
++            }
++            return EXT_RETURN_SENT;
++        }
++
++    case TLSEXT_TYPE_record_size_limit:
++        if (!WPACKET_put_bytes_u16(pkt, type)
++            || !WPACKET_start_sub_packet_u16(pkt)
++            || !WPACKET_put_bytes_u16(pkt, SSL3_RT_MAX_PLAIN_LENGTH + 1)
++            || !WPACKET_close(pkt)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return EXT_RETURN_FAIL;
++        }
++        return EXT_RETURN_SENT;
++
++    case TLSEXT_TYPE_encrypted_client_hello:
++        {
++            static const unsigned char enc[32] = {
++                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
++                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xf0, 0x01,
++                0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89,
++                0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef, 0xf1, 0x02
++            };
++            static const unsigned char payload[16] = {
++                0x6a, 0x61, 0x34, 0x2d, 0x67, 0x72, 0x65, 0x61,
++                0x73, 0x65, 0x2d, 0x65, 0x63, 0x68, 0x2d, 0x31
++            };
++
++            if (!WPACKET_put_bytes_u16(pkt, type)
++                || !WPACKET_start_sub_packet_u16(pkt)
++                || !WPACKET_put_bytes_u8(pkt, 0)
++                || !WPACKET_put_bytes_u16(pkt, 1)
++                || !WPACKET_put_bytes_u16(pkt, 1)
++                || !WPACKET_put_bytes_u8(pkt, 0x2a)
++                || !WPACKET_sub_memcpy_u16(pkt, enc, sizeof(enc))
++                || !WPACKET_sub_memcpy_u16(pkt, payload, sizeof(payload))
++                || !WPACKET_close(pkt)) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return EXT_RETURN_FAIL;
++            }
++            return EXT_RETURN_SENT;
++        }
++
++    default:
++        if (!WPACKET_put_bytes_u16(pkt, type)
++            || !WPACKET_start_sub_packet_u16(pkt)
++            || !WPACKET_close(pkt)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return EXT_RETURN_FAIL;
++        }
++        return EXT_RETURN_SENT;
++    }
++}
++
+ /*
+  * Construct all the extensions relevant to the current |context| and write
+  * them to |pkt|. If this is an extension for a Certificate in a Certificate
+@@ -804,6 +902,11 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
+     int min_version, max_version = 0, reason;
+     const EXTENSION_DEFINITION *thisexd;
+     int for_comp = (context & SSL_EXT_TLS1_3_CERTIFICATE_COMPRESSION) != 0;
++    const uint16_t *ja4_extension_order = NULL;
++    size_t ja4_extension_order_len = 0;
++    int ja4_extension_mode = 0;
++    int ja4_have_override = 0;
++    unsigned char *handled = NULL;
+ 
+     if (!WPACKET_start_sub_packet_u16(pkt)
+         /*
+@@ -838,30 +941,173 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
+         return 0;
+     }
+ 
+-    for (i = 0, thisexd = ext_defs; i < OSSL_NELEM(ext_defs); i++, thisexd++) {
+-        EXT_RETURN (*construct)(SSL_CONNECTION *s, WPACKET *pkt,
+-            unsigned int context,
+-            X509 *x, size_t chainidx);
+-        EXT_RETURN ret;
++    if ((context & SSL_EXT_CLIENT_HELLO) != 0) {
++        ja4_have_override = ossl_ja4_get_extension_override(&ja4_extension_order,
++            &ja4_extension_order_len, &ja4_extension_mode);
++        if (ja4_have_override) {
++            uint16_t grease_ext = 0;
++            handled = OPENSSL_zalloc(OSSL_NELEM(ext_defs));
++            if (handled == NULL) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return 0;
++            }
++            if (ja4_extension_mode != OSSL_JA4_MODE_EXACT
++                && ossl_ja4_get_grease_value(&grease_ext)) {
++                EXT_RETURN ret = ja4_construct_synthetic_extension(s, pkt,
++                    grease_ext);
+ 
+-        /* Skip if not relevant for our context */
+-        if (!should_add_extension(s, thisexd->context, context, max_version))
+-            continue;
++                if (ret == EXT_RETURN_FAIL) {
++                    OPENSSL_free(handled);
++                    return 0;
++                }
++                if (ret == EXT_RETURN_SENT)
++                    ossl_ja4_note_extension(grease_ext);
++            }
++        }
++    }
+ 
+-        construct = s->server ? thisexd->construct_stoc
+-                              : thisexd->construct_ctos;
++    if (ja4_have_override) {
++        for (i = 0; i < ja4_extension_order_len; i++) {
++            size_t j;
++            int emitted = 0;
++
++            for (j = 0, thisexd = ext_defs; j < OSSL_NELEM(ext_defs); j++, thisexd++) {
++                EXT_RETURN (*construct)(SSL_CONNECTION *s, WPACKET *pkt,
++                    unsigned int context,
++                    X509 *x, size_t chainidx);
++                EXT_RETURN ret;
++
++                if (thisexd->type != ja4_extension_order[i])
++                    continue;
++                handled[j] = 1;
++                if (!should_add_extension(s, thisexd->context, context, max_version))
++                    break;
++                construct = s->server ? thisexd->construct_stoc
++                                      : thisexd->construct_ctos;
++                if (construct == NULL)
++                    break;
++                ret = construct(s, pkt, context, x, chainidx);
++                if (ret == EXT_RETURN_FAIL) {
++                    OPENSSL_free(handled);
++                    return 0;
++                }
++                if (ret == EXT_RETURN_SENT) {
++                    emitted = 1;
++                    if ((context & (SSL_EXT_CLIENT_HELLO
++                            | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST
++                            | SSL_EXT_TLS1_3_NEW_SESSION_TICKET)) != 0) {
++                        s->ext.extflags[j] |= SSL_EXT_FLAG_SENT;
++                    }
++                    if ((context & SSL_EXT_CLIENT_HELLO) != 0)
++                        ossl_ja4_note_extension(thisexd->type);
++                }
++                break;
++            }
+ 
+-        if (construct == NULL)
+-            continue;
++            if (!emitted && (context & SSL_EXT_CLIENT_HELLO) != 0) {
++                EXT_RETURN ret = ja4_construct_synthetic_extension(s, pkt,
++                    ja4_extension_order[i]);
+ 
+-        ret = construct(s, pkt, context, x, chainidx);
+-        if (ret == EXT_RETURN_FAIL) {
+-            /* SSLfatal() already called */
+-            return 0;
++                if (ret == EXT_RETURN_FAIL) {
++                    OPENSSL_free(handled);
++                    return 0;
++                }
++                if (ret == EXT_RETURN_SENT)
++                    ossl_ja4_note_extension(ja4_extension_order[i]);
++            }
++        }
++
++        if (ja4_extension_mode != OSSL_JA4_MODE_EXACT) {
++            for (i = 0, thisexd = ext_defs; i < OSSL_NELEM(ext_defs); i++, thisexd++) {
++                EXT_RETURN (*construct)(SSL_CONNECTION *s, WPACKET *pkt,
++                    unsigned int context,
++                    X509 *x, size_t chainidx);
++                EXT_RETURN ret;
++
++                if (handled[i] != 0)
++                    continue;
++                if (!should_add_extension(s, thisexd->context, context, max_version))
++                    continue;
++                construct = s->server ? thisexd->construct_stoc
++                                      : thisexd->construct_ctos;
++                if (construct == NULL)
++                    continue;
++                ret = construct(s, pkt, context, x, chainidx);
++                if (ret == EXT_RETURN_FAIL) {
++                    OPENSSL_free(handled);
++                    return 0;
++                }
++                if (ret == EXT_RETURN_SENT) {
++                    if ((context & (SSL_EXT_CLIENT_HELLO
++                            | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST
++                            | SSL_EXT_TLS1_3_NEW_SESSION_TICKET)) != 0) {
++                        s->ext.extflags[i] |= SSL_EXT_FLAG_SENT;
++                    }
++                    if ((context & SSL_EXT_CLIENT_HELLO) != 0)
++                        ossl_ja4_note_extension(thisexd->type);
++                }
++            }
++        } else if (!ossl_ja4_is_strict_enabled()) {
++            for (i = 0, thisexd = ext_defs; i < OSSL_NELEM(ext_defs); i++, thisexd++) {
++                EXT_RETURN (*construct)(SSL_CONNECTION *s, WPACKET *pkt,
++                    unsigned int context,
++                    X509 *x, size_t chainidx);
++                EXT_RETURN ret;
++
++                if (handled[i] != 0)
++                    continue;
++                if (!ja4_exact_should_preserve_extension(s, thisexd, context,
++                        max_version))
++                    continue;
++                construct = s->server ? thisexd->construct_stoc
++                                      : thisexd->construct_ctos;
++                if (construct == NULL)
++                    continue;
++                ret = construct(s, pkt, context, x, chainidx);
++                if (ret == EXT_RETURN_FAIL) {
++                    OPENSSL_free(handled);
++                    return 0;
++                }
++                if (ret == EXT_RETURN_SENT) {
++                    if ((context & (SSL_EXT_CLIENT_HELLO
++                            | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST
++                            | SSL_EXT_TLS1_3_NEW_SESSION_TICKET)) != 0) {
++                        s->ext.extflags[i] |= SSL_EXT_FLAG_SENT;
++                    }
++                    if ((context & SSL_EXT_CLIENT_HELLO) != 0)
++                        ossl_ja4_note_extension(thisexd->type);
++                }
++            }
++        }
++        OPENSSL_free(handled);
++    } else {
++        for (i = 0, thisexd = ext_defs; i < OSSL_NELEM(ext_defs); i++, thisexd++) {
++            EXT_RETURN (*construct)(SSL_CONNECTION *s, WPACKET *pkt,
++                unsigned int context,
++                X509 *x, size_t chainidx);
++            EXT_RETURN ret;
++
++            /* Skip if not relevant for our context */
++            if (!should_add_extension(s, thisexd->context, context, max_version))
++                continue;
++
++            construct = s->server ? thisexd->construct_stoc
++                                  : thisexd->construct_ctos;
++
++            if (construct == NULL)
++                continue;
++
++            ret = construct(s, pkt, context, x, chainidx);
++            if (ret == EXT_RETURN_FAIL) {
++                /* SSLfatal() already called */
++                return 0;
++            }
++            if (ret == EXT_RETURN_SENT
++                && (context & (SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST | SSL_EXT_TLS1_3_NEW_SESSION_TICKET)) != 0)
++                s->ext.extflags[i] |= SSL_EXT_FLAG_SENT;
++            if (ret == EXT_RETURN_SENT && (context & SSL_EXT_CLIENT_HELLO) != 0)
++                ossl_ja4_note_extension(thisexd->type);
+         }
+-        if (ret == EXT_RETURN_SENT
+-            && (context & (SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST | SSL_EXT_TLS1_3_NEW_SESSION_TICKET)) != 0)
+-            s->ext.extflags[i] |= SSL_EXT_FLAG_SENT;
+     }
+ 
+     if (!WPACKET_close(pkt)) {
+@@ -873,6 +1119,31 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
+     return 1;
+ }
+ 
++static int ja4_exact_should_preserve_extension(SSL_CONNECTION *s,
++    const EXTENSION_DEFINITION *thisexd, unsigned int context, int max_version)
++{
++    if ((context & SSL_EXT_CLIENT_HELLO) == 0)
++        return 0;
++    if (!should_add_extension(s, thisexd->context, context, max_version))
++        return 0;
++
++    switch (thisexd->type) {
++    case TLSEXT_TYPE_server_name:
++        return s->ext.hostname != NULL && !ossl_ja4_should_suppress_sni();
++    case TLSEXT_TYPE_signature_algorithms:
++    case TLSEXT_TYPE_signature_algorithms_cert:
++    case TLSEXT_TYPE_supported_versions:
++    case TLSEXT_TYPE_psk_kex_modes:
++    case TLSEXT_TYPE_key_share:
++    case TLSEXT_TYPE_cookie:
++        return 1;
++    case TLSEXT_TYPE_supported_groups:
++        return max_version >= TLS1_3_VERSION;
++    default:
++        return 0;
++    }
++}
++
+ /*
+  * Built in extension finalisation and initialisation functions. All initialise
+  * or finalise the associated extension type for the given |context|. For
+diff --git a/ssl/statem/extensions_clnt.c b/ssl/statem/extensions_clnt.c
+index 6453b84fd7..7cf01e5f7d 100644
+--- a/ssl/statem/extensions_clnt.c
++++ b/ssl/statem/extensions_clnt.c
+@@ -71,6 +71,9 @@ EXT_RETURN tls_construct_ctos_server_name(SSL_CONNECTION *s, WPACKET *pkt,
+     unsigned int context, X509 *x,
+     size_t chainidx)
+ {
++    if (ossl_ja4_should_suppress_sni())
++        return EXT_RETURN_NOT_SENT;
++
+     if (s->ext.hostname == NULL)
+         return EXT_RETURN_NOT_SENT;
+ 
+@@ -257,6 +260,8 @@ EXT_RETURN tls_construct_ctos_supported_groups(SSL_CONNECTION *s, WPACKET *pkt,
+     size_t chainidx)
+ {
+     const uint16_t *pgroups = NULL;
++    const uint16_t *ja4_groups = NULL;
++    size_t ja4_groups_len = 0;
+     size_t num_groups = 0, i, tls13added = 0, added = 0;
+     int min_version, max_version, reason;
+     int dtls = SSL_CONNECTION_IS_DTLS(s);
+@@ -281,7 +286,12 @@ EXT_RETURN tls_construct_ctos_supported_groups(SSL_CONNECTION *s, WPACKET *pkt,
+     /*
+      * Add TLS extension supported_groups to the ClientHello message
+      */
+-    tls1_get_supported_groups(s, &pgroups, &num_groups);
++    if (ossl_ja4_get_supported_groups_override(&ja4_groups, &ja4_groups_len)) {
++        pgroups = ja4_groups;
++        num_groups = ja4_groups_len;
++    } else {
++        tls1_get_supported_groups(s, &pgroups, &num_groups);
++    }
+ 
+     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_supported_groups)
+         /* Sub-packet for supported_groups extension */
+@@ -309,6 +319,7 @@ EXT_RETURN tls_construct_ctos_supported_groups(SSL_CONNECTION *s, WPACKET *pkt,
+             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+             return EXT_RETURN_FAIL;
+         }
++        ossl_ja4_note_supported_group(ctmp);
+         if (okfortls13 && max_version == TLS1_3_VERSION)
+             tls13added++;
+         added++;
+@@ -336,8 +347,9 @@ EXT_RETURN tls_construct_ctos_session_ticket(SSL_CONNECTION *s, WPACKET *pkt,
+     size_t chainidx)
+ {
+     size_t ticklen;
++    int ja4_force = ossl_ja4_extension_requested(TLSEXT_TYPE_session_ticket);
+ 
+-    if (!tls_use_ticket(s))
++    if (!tls_use_ticket(s) && !ja4_force)
+         return EXT_RETURN_NOT_SENT;
+ 
+     if (!s->new_session && s->session != NULL
+@@ -359,7 +371,8 @@ EXT_RETURN tls_construct_ctos_session_ticket(SSL_CONNECTION *s, WPACKET *pkt,
+         ticklen = 0;
+     }
+ 
+-    if (ticklen == 0 && s->ext.session_ticket != NULL && s->ext.session_ticket->data == NULL)
++    if (ticklen == 0 && s->ext.session_ticket != NULL
++        && s->ext.session_ticket->data == NULL && !ja4_force)
+         return EXT_RETURN_NOT_SENT;
+ 
+     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_session_ticket)
+@@ -377,6 +390,11 @@ EXT_RETURN tls_construct_ctos_sig_algs(SSL_CONNECTION *s, WPACKET *pkt,
+ {
+     size_t salglen;
+     const uint16_t *salg;
++    const uint16_t *ja4_salg = NULL;
++    size_t ja4_salglen = 0;
++    uint16_t grease_sigalg = 0;
++    int add_grease_sigalg = 0;
++    size_t i;
+ 
+     /*
+      * This used both in the initial hello and as part of renegotiation,
+@@ -395,15 +413,58 @@ EXT_RETURN tls_construct_ctos_sig_algs(SSL_CONNECTION *s, WPACKET *pkt,
+             return EXT_RETURN_NOT_SENT;
+     }
+ 
+-    salglen = tls12_get_psigalgs(s, 1, &salg);
++    if (ossl_ja4_get_sigalg_override(&ja4_salg, &ja4_salglen)) {
++        salg = ja4_salg;
++        salglen = ja4_salglen;
++    } else {
++        salglen = tls12_get_psigalgs(s, 1, &salg);
++    }
++
++    if (ossl_ja4_get_grease_value(&grease_sigalg)) {
++        add_grease_sigalg = 1;
++        for (i = 0; i < salglen; i++) {
++            if (salg[i] == grease_sigalg) {
++                add_grease_sigalg = 0;
++                break;
++            }
++        }
++    }
++
+     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_signature_algorithms)
+         /* Sub-packet for sig-algs extension */
+         || !WPACKET_start_sub_packet_u16(pkt)
+         /* Sub-packet for the actual list */
+-        || !WPACKET_start_sub_packet_u16(pkt)
+-        || !tls12_copy_sigalgs(s, pkt, salg, salglen)
+-        || !WPACKET_close(pkt)
+-        || !WPACKET_close(pkt)) {
++        || !WPACKET_start_sub_packet_u16(pkt)) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++        return EXT_RETURN_FAIL;
++    }
++
++    if (ja4_salg != NULL) {
++        for (i = 0; i < salglen; i++) {
++            if (!WPACKET_put_bytes_u16(pkt, salg[i])) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return EXT_RETURN_FAIL;
++            }
++            ossl_ja4_note_signature_algorithm(salg[i]);
++        }
++    } else {
++        if (!tls12_copy_sigalgs(s, pkt, salg, salglen)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return EXT_RETURN_FAIL;
++        }
++        for (i = 0; i < salglen; i++)
++            ossl_ja4_note_signature_algorithm(salg[i]);
++    }
++
++    if (add_grease_sigalg) {
++        if (!WPACKET_put_bytes_u16(pkt, grease_sigalg)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return EXT_RETURN_FAIL;
++        }
++        ossl_ja4_note_signature_algorithm(grease_sigalg);
++    }
++
++    if (!WPACKET_close(pkt) || !WPACKET_close(pkt)) {
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+         return EXT_RETURN_FAIL;
+     }
+@@ -417,12 +478,13 @@ EXT_RETURN tls_construct_ctos_status_request(SSL_CONNECTION *s, WPACKET *pkt,
+     size_t chainidx)
+ {
+     int i;
++    int ja4_force = ossl_ja4_extension_requested(TLSEXT_TYPE_status_request);
+ 
+     /* This extension isn't defined for client Certificates */
+     if (x != NULL)
+         return EXT_RETURN_NOT_SENT;
+ 
+-    if (s->ext.status_type != TLSEXT_STATUSTYPE_ocsp)
++    if (s->ext.status_type != TLSEXT_STATUSTYPE_ocsp && !ja4_force)
+         return EXT_RETURN_NOT_SENT;
+ 
+     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_status_request)
+@@ -434,7 +496,7 @@ EXT_RETURN tls_construct_ctos_status_request(SSL_CONNECTION *s, WPACKET *pkt,
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+         return EXT_RETURN_FAIL;
+     }
+-    for (i = 0; i < sk_OCSP_RESPID_num(s->ext.ocsp.ids); i++) {
++    for (i = 0; !ja4_force && i < sk_OCSP_RESPID_num(s->ext.ocsp.ids); i++) {
+         unsigned char *idbytes;
+         OCSP_RESPID *id = sk_OCSP_RESPID_value(s->ext.ocsp.ids, i);
+         int idlen = i2d_OCSP_RESPID(id, NULL);
+@@ -452,7 +514,7 @@ EXT_RETURN tls_construct_ctos_status_request(SSL_CONNECTION *s, WPACKET *pkt,
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+         return EXT_RETURN_FAIL;
+     }
+-    if (s->ext.ocsp.exts) {
++    if (!ja4_force && s->ext.ocsp.exts) {
+         unsigned char *extbytes;
+         int extlen = i2d_X509_EXTENSIONS(s->ext.ocsp.exts, NULL);
+ 
+@@ -503,9 +565,28 @@ EXT_RETURN tls_construct_ctos_alpn(SSL_CONNECTION *s, WPACKET *pkt,
+     unsigned int context,
+     X509 *x, size_t chainidx)
+ {
++    const unsigned char *ja4_alpn = NULL;
++    size_t ja4_alpn_len = 0;
++
+     s->s3.alpn_sent = 0;
+ 
+-    if (s->ext.alpn == NULL || !SSL_IS_FIRST_HANDSHAKE(s))
++    if (!SSL_IS_FIRST_HANDSHAKE(s))
++        return EXT_RETURN_NOT_SENT;
++
++    if (ossl_ja4_get_alpn_override(&ja4_alpn, &ja4_alpn_len)) {
++        if (!WPACKET_put_bytes_u16(pkt,
++                TLSEXT_TYPE_application_layer_protocol_negotiation)
++            || !WPACKET_start_sub_packet_u16(pkt)
++            || !WPACKET_sub_memcpy_u16(pkt, ja4_alpn, ja4_alpn_len)
++            || !WPACKET_close(pkt)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return EXT_RETURN_FAIL;
++        }
++        s->s3.alpn_sent = 1;
++        return EXT_RETURN_SENT;
++    }
++
++    if (s->ext.alpn == NULL)
+         return EXT_RETURN_NOT_SENT;
+ 
+     if (!WPACKET_put_bytes_u16(pkt,
+@@ -568,6 +649,11 @@ EXT_RETURN tls_construct_ctos_etm(SSL_CONNECTION *s, WPACKET *pkt,
+     unsigned int context,
+     X509 *x, size_t chainidx)
+ {
++    if (ossl_ja4_has_extension_override()
++        && !ossl_ja4_extension_requested(TLSEXT_TYPE_encrypt_then_mac)) {
++        return EXT_RETURN_NOT_SENT;
++    }
++
+     if (s->options & SSL_OP_NO_ENCRYPT_THEN_MAC)
+         return EXT_RETURN_NOT_SENT;
+ 
+@@ -585,7 +671,8 @@ EXT_RETURN tls_construct_ctos_sct(SSL_CONNECTION *s, WPACKET *pkt,
+     unsigned int context,
+     X509 *x, size_t chainidx)
+ {
+-    if (s->ct_validation_callback == NULL)
++    if (s->ct_validation_callback == NULL
++        && !ossl_ja4_extension_requested(TLSEXT_TYPE_signed_certificate_timestamp))
+         return EXT_RETURN_NOT_SENT;
+ 
+     /* Not defined for client Certificates */
+@@ -622,6 +709,8 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
+     unsigned int context, X509 *x,
+     size_t chainidx)
+ {
++    const uint16_t *ja4_versions = NULL;
++    size_t ja4_versions_len = 0;
+     int currv, min_version, max_version, reason;
+ 
+     reason = ssl_get_min_max_version(s, &min_version, &max_version, NULL);
+@@ -644,10 +733,23 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
+         return EXT_RETURN_FAIL;
+     }
+ 
+-    for (currv = max_version; currv >= min_version; currv--) {
+-        if (!WPACKET_put_bytes_u16(pkt, currv)) {
+-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+-            return EXT_RETURN_FAIL;
++    if (ossl_ja4_get_supported_versions_override(&ja4_versions, &ja4_versions_len)) {
++        size_t i;
++
++        for (i = 0; i < ja4_versions_len; i++) {
++            if (!WPACKET_put_bytes_u16(pkt, ja4_versions[i])) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return EXT_RETURN_FAIL;
++            }
++            ossl_ja4_note_supported_version(ja4_versions[i]);
++        }
++    } else {
++        for (currv = max_version; currv >= min_version; currv--) {
++            if (!WPACKET_put_bytes_u16(pkt, currv)) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return EXT_RETURN_FAIL;
++            }
++            ossl_ja4_note_supported_version((uint16_t)currv);
+         }
+     }
+     if (!WPACKET_close(pkt) || !WPACKET_close(pkt)) {
+@@ -666,22 +768,78 @@ EXT_RETURN tls_construct_ctos_psk_kex_modes(SSL_CONNECTION *s, WPACKET *pkt,
+     size_t chainidx)
+ {
+ #ifndef OPENSSL_NO_TLS1_3
++    const unsigned char *ja4_modes = NULL;
++    size_t ja4_modes_len = 0;
+     int nodhe = s->options & SSL_OP_ALLOW_NO_DHE_KEX;
+-
+-    if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_psk_kex_modes)
+-        || !WPACKET_start_sub_packet_u16(pkt)
+-        || !WPACKET_start_sub_packet_u8(pkt)
+-        || !WPACKET_put_bytes_u8(pkt, TLSEXT_KEX_MODE_KE_DHE)
+-        || (nodhe && !WPACKET_put_bytes_u8(pkt, TLSEXT_KEX_MODE_KE))
+-        || !WPACKET_close(pkt)
+-        || !WPACKET_close(pkt)) {
+-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+-        return EXT_RETURN_FAIL;
++    /* JA4 EXACT-mode: never auto-emit psk_kex_modes if it's not in the
++     * user-specified extension_order. Some upstream code paths call this
++     * builder unconditionally for TLS 1.3 — that breaks 1:1 imitation of
++     * captured ClientHellos that omit 002d (e.g. Tor Browser). */
++    {
++        const uint16_t *order = NULL;
++        size_t order_len = 0;
++        int mode = 0;
++        size_t i;
++        ossl_ja4_get_extension_override(&order, &order_len, &mode);
++        if (mode == OSSL_JA4_MODE_EXACT && order_len > 0) {
++            int contains = 0;
++            for (i = 0; i < order_len; i++) {
++                if (order[i] == TLSEXT_TYPE_psk_kex_modes) {
++                    contains = 1;
++                    break;
++                }
++            }
++            if (!contains) {
++                return EXT_RETURN_NOT_SENT;
++            }
++        }
+     }
+ 
+-    s->ext.psk_kex_mode = TLSEXT_KEX_MODE_FLAG_KE_DHE;
+-    if (nodhe)
+-        s->ext.psk_kex_mode |= TLSEXT_KEX_MODE_FLAG_KE;
++    if (ossl_ja4_get_psk_modes_override(&ja4_modes, &ja4_modes_len)) {
++        size_t i;
++
++        if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_psk_kex_modes)
++            || !WPACKET_start_sub_packet_u16(pkt)
++            || !WPACKET_start_sub_packet_u8(pkt)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return EXT_RETURN_FAIL;
++        }
++        s->ext.psk_kex_mode = 0;
++        for (i = 0; i < ja4_modes_len; i++) {
++            if (!WPACKET_put_bytes_u8(pkt, ja4_modes[i])) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return EXT_RETURN_FAIL;
++            }
++            ossl_ja4_note_psk_mode(ja4_modes[i]);
++            if (ja4_modes[i] == TLSEXT_KEX_MODE_KE_DHE)
++                s->ext.psk_kex_mode |= TLSEXT_KEX_MODE_FLAG_KE_DHE;
++            if (ja4_modes[i] == TLSEXT_KEX_MODE_KE)
++                s->ext.psk_kex_mode |= TLSEXT_KEX_MODE_FLAG_KE;
++        }
++        if (!WPACKET_close(pkt) || !WPACKET_close(pkt)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return EXT_RETURN_FAIL;
++        }
++    } else {
++        if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_psk_kex_modes)
++            || !WPACKET_start_sub_packet_u16(pkt)
++            || !WPACKET_start_sub_packet_u8(pkt)
++            || !WPACKET_put_bytes_u8(pkt, TLSEXT_KEX_MODE_KE_DHE)
++            || (nodhe && !WPACKET_put_bytes_u8(pkt, TLSEXT_KEX_MODE_KE))
++            || !WPACKET_close(pkt)
++            || !WPACKET_close(pkt)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return EXT_RETURN_FAIL;
++        }
++
++        ossl_ja4_note_psk_mode(TLSEXT_KEX_MODE_KE_DHE);
++        if (nodhe)
++            ossl_ja4_note_psk_mode(TLSEXT_KEX_MODE_KE);
++
++        s->ext.psk_kex_mode = TLSEXT_KEX_MODE_FLAG_KE_DHE;
++        if (nodhe)
++            s->ext.psk_kex_mode |= TLSEXT_KEX_MODE_FLAG_KE;
++    }
+ #endif
+ 
+     return EXT_RETURN_SENT;
+@@ -756,6 +914,8 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
+ #ifndef OPENSSL_NO_TLS1_3
+     size_t i, num_groups = 0;
+     const uint16_t *pgroups = NULL;
++    const uint16_t *ja4_keyshare_groups = NULL;
++    size_t ja4_keyshare_groups_len = 0;
+     uint16_t group_id = 0;
+     int add_only_one = 0;
+     size_t valid_keyshare = 0;
+@@ -770,7 +930,13 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
+         return EXT_RETURN_FAIL;
+     }
+ 
+-    tls1_get_requested_keyshare_groups(s, &pgroups, &num_groups);
++    if (ossl_ja4_get_keyshare_groups_override(&ja4_keyshare_groups,
++            &ja4_keyshare_groups_len)) {
++        pgroups = ja4_keyshare_groups;
++        num_groups = ja4_keyshare_groups_len;
++    } else {
++        tls1_get_requested_keyshare_groups(s, &pgroups, &num_groups);
++    }
+     if (num_groups == 1 && pgroups[0] == 0) { /* Indication that no * prefix was used */
+         tls1_get_supported_groups(s, &pgroups, &num_groups);
+         add_only_one = 1;
+@@ -792,6 +958,7 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
+             /* SSLfatal() already called */
+             return EXT_RETURN_FAIL;
+         }
++        ossl_ja4_note_keyshare_group(group_id);
+         valid_keyshare++;
+     } else {
+         if (s->ext.supportedgroups == NULL) /* use default */
+@@ -814,6 +981,7 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
+                 /* SSLfatal() already called */
+                 return EXT_RETURN_FAIL;
+             }
++            ossl_ja4_note_keyshare_group(group_id);
+             valid_keyshare++;
+             if (add_only_one)
+                 break;
+@@ -1044,6 +1212,11 @@ EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
+     unsigned char *padbytes;
+     size_t hlen;
+ 
++    if (ossl_ja4_has_extension_override()
++        && !ossl_ja4_extension_requested(TLSEXT_TYPE_padding)) {
++        return EXT_RETURN_NOT_SENT;
++    }
++
+     if ((s->options & SSL_OP_TLSEXT_PADDING) == 0)
+         return EXT_RETURN_NOT_SENT;
+ 
+@@ -1327,6 +1500,11 @@ EXT_RETURN tls_construct_ctos_post_handshake_auth(SSL_CONNECTION *s, WPACKET *pk
+     ossl_unused size_t chainidx)
+ {
+ #ifndef OPENSSL_NO_TLS1_3
++    if (ossl_ja4_has_extension_override()
++        && !ossl_ja4_extension_requested(TLSEXT_TYPE_post_handshake_auth)) {
++        return EXT_RETURN_NOT_SENT;
++    }
++
+     if (!s->pha_enabled)
+         return EXT_RETURN_NOT_SENT;
+ 
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index 3907664ebc..167ef6cfee 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -1182,6 +1182,13 @@ CON_FUNC_RETURN tls_construct_client_hello(SSL_CONNECTION *s, WPACKET *pkt)
+     SSL_SESSION *sess = s->session;
+     unsigned char *session_id;
+     SSL_CTX *sctx = SSL_CONNECTION_GET_CTX(s);
++    int ja4_prepare_ok;
++
++    ja4_prepare_ok = ossl_ja4_prepare_client_hello(s);
++    if (!ja4_prepare_ok) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++        return CON_FUNC_ERROR;
++    }
+ 
+     /* Work out what SSL/TLS/DTLS version to use */
+     protverr = ssl_set_client_hello_version(s);
+@@ -1355,6 +1362,31 @@ CON_FUNC_RETURN tls_construct_client_hello(SSL_CONNECTION *s, WPACKET *pkt)
+         return CON_FUNC_ERROR;
+     }
+ 
++    /*
++     * JA4 phase-3 wire rewrite: after the ClientHello body is fully built but
++     * before the outer u24 ClientHello-length sub-packet is closed by the
++     * statem_clnt write loop, walk the serialized extension block and replace
++     * selected extension bodies byte-for-byte (analogous to
++     * ssl3_Ja4RewriteTls13ExtensionBodies in NSS). Failure to rewrite is fatal
++     * only for active JA4 configs that explicitly demand a body override.
++     */
++    if (!SSL_CONNECTION_IS_DTLS(s)
++        && !ossl_ja4_rewrite_client_hello_wire(s, pkt)) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++        return CON_FUNC_ERROR;
++    }
++
++    ossl_ja4_write_dump(s);
++
++    if (ossl_ja4_is_strict_enabled()) {
++        uint32_t ja4_mismatch = 0;
++
++        if (ossl_ja4_get_mismatch_mask(&ja4_mismatch) && ja4_mismatch != 0) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            return CON_FUNC_ERROR;
++        }
++    }
++
+     return CON_FUNC_SUCCESS;
+ }
+ 
+@@ -4140,6 +4172,16 @@ int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
+         && ssl_security(s, SSL_SECOP_VERSION, 0, TLS1_VERSION, NULL)
+         && s->min_proto_version <= TLS1_VERSION;
+     SSL *ssl = SSL_CONNECTION_GET_SSL(s);
++    const uint16_t *ja4_ciphers = NULL;
++    size_t ja4_ciphers_len = 0;
++    int ja4_cipher_mode = 0;
++    int ja4_have_override = 0;
++    unsigned char *selected = NULL;
++    size_t selected_len = 0;
++    size_t selected_cap = 0;
++
++    ja4_have_override = ossl_ja4_get_cipher_override(&ja4_ciphers,
++        &ja4_ciphers_len, &ja4_cipher_mode);
+ 
+     /* Set disabled masks for this session */
+     if (!ssl_set_client_disabled(s)) {
+@@ -4173,30 +4215,223 @@ int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
+     if (s->mode & SSL_MODE_SEND_FALLBACK_SCSV)
+         maxlen -= 2;
+ 
+-    for (i = 0; i < sk_SSL_CIPHER_num(sk) && totlen < maxlen; i++) {
+-        const SSL_CIPHER *c;
++    /* JA4 EXACT-mode: trust the user's explicit cipher list, override the
++     * compile-time TLS-1.2 cap so all configured IDs land on the wire.
++     * The cap is a defensive workaround for old servers that hang on
++     * large ClientHellos — irrelevant for fingerprint-replay use cases. */
++    if (ja4_have_override && ja4_cipher_mode == OSSL_JA4_MODE_EXACT) {
++        maxlen = 0xfffe;
++        if (empty_reneg_info_scsv)
++            maxlen -= 2;
++        if (s->mode & SSL_MODE_SEND_FALLBACK_SCSV)
++            maxlen -= 2;
++    }
++
++    if (ja4_have_override) {
++        for (i = 0; i < (int)ja4_ciphers_len && totlen < maxlen; i++) {
++            const SSL_CIPHER *c = NULL;
++            int j;
++            unsigned char cipher_id[2];
++
++            cipher_id[0] = (unsigned char)(ja4_ciphers[i] >> 8);
++            cipher_id[1] = (unsigned char)(ja4_ciphers[i] & 0xff);
++            c = SSL_CIPHER_find(SSL_CONNECTION_GET_SSL(s), cipher_id);
++            if (c == NULL) {
++                if (ja4_cipher_mode != OSSL_JA4_MODE_EXACT)
++                    continue;
++                /* JA4 EXACT-mode raw emission: the requested cipher ID has
++                 * no compiled SSL_CIPHER object. Write the 2-byte ID verbatim
++                 * so the server-visible JA4 hash reflects the user's exact
++                 * list. If the server actually picked this ID, ServerHello
++                 * processing would abort with SSL_R_UNKNOWN_CIPHER_RETURNED;
++                 * for pure JA4 imitation that path is never taken. */
++                if (!WPACKET_put_bytes_u16(pkt, ja4_ciphers[i])) {
++                    OPENSSL_free(selected);
++                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                    return 0;
++                }
++                totlen += 2;
++                if (selected_len + 2 > selected_cap) {
++                    size_t next_cap = selected_cap == 0 ? 32 : selected_cap * 2;
++                    unsigned char *next = OPENSSL_realloc(selected,
++                        next_cap * sizeof(*selected));
++
++                    if (next == NULL) {
++                        OPENSSL_free(selected);
++                        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                        return 0;
++                    }
++                    selected = next;
++                    selected_cap = next_cap;
++                }
++                selected[selected_len++] = cipher_id[0];
++                selected[selected_len++] = cipher_id[1];
++                continue;
++            }
++            for (j = 0; j < sk_SSL_CIPHER_num(sk); j++) {
++                if (sk_SSL_CIPHER_value(sk, j) == c)
++                    break;
++            }
++            if (j >= sk_SSL_CIPHER_num(sk)
++                || ssl_cipher_disabled(s, c, SSL_SECOP_CIPHER_SUPPORTED, 0)) {
++                /* JA4 EXACT-mode: cipher is recognized by OpenSSL but not in
++                 * the supported/enabled stack (e.g. Camellia compiled out,
++                 * SCSV not active, etc.). Write the raw 2-byte ID anyway —
++                 * the user explicitly listed it and we're imitating wire
++                 * shape, not negotiating. */
++                if (ja4_cipher_mode == OSSL_JA4_MODE_EXACT) {
++                    if (!WPACKET_put_bytes_u16(pkt, ja4_ciphers[i])) {
++                        OPENSSL_free(selected);
++                        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                        return 0;
++                    }
++                    totlen += 2;
++                    if (selected_len + 2 > selected_cap) {
++                        size_t next_cap = selected_cap == 0 ? 32 : selected_cap * 2;
++                        unsigned char *next = OPENSSL_realloc(selected,
++                            next_cap * sizeof(*selected));
++                        if (next == NULL) {
++                            OPENSSL_free(selected);
++                            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                            return 0;
++                        }
++                        selected = next;
++                        selected_cap = next_cap;
++                    }
++                    selected[selected_len++] = cipher_id[0];
++                    selected[selected_len++] = cipher_id[1];
++                }
++                continue;
++            }
++            if (!ssl->method->put_cipher_by_char(c, pkt, &len)) {
++                OPENSSL_free(selected);
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return 0;
++            }
++            if (!maxverok) {
++                int minproto = SSL_CONNECTION_IS_DTLS(s) ? c->min_dtls : c->min_tls;
++                int maxproto = SSL_CONNECTION_IS_DTLS(s) ? c->max_dtls : c->max_tls;
+ 
+-        c = sk_SSL_CIPHER_value(sk, i);
+-        /* Skip disabled ciphers */
+-        if (ssl_cipher_disabled(s, c, SSL_SECOP_CIPHER_SUPPORTED, 0))
+-            continue;
++                if (ssl_version_cmp(s, maxproto, s->s3.tmp.max_ver) >= 0
++                    && ssl_version_cmp(s, minproto, s->s3.tmp.max_ver) <= 0)
++                    maxverok = 1;
++            }
++            totlen += len;
++            if (selected_len + 2 > selected_cap) {
++                size_t next_cap = selected_cap == 0 ? 32 : selected_cap * 2;
++                unsigned char *next = OPENSSL_realloc(selected,
++                    next_cap * sizeof(*selected));
++
++                if (next == NULL) {
++                    OPENSSL_free(selected);
++                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                    return 0;
++                }
++                selected = next;
++                selected_cap = next_cap;
++            }
++            selected[selected_len++] = cipher_id[0];
++            selected[selected_len++] = cipher_id[1];
++        }
++
++        if (ja4_cipher_mode == OSSL_JA4_MODE_REORDER) {
++            for (i = 0; i < sk_SSL_CIPHER_num(sk) && totlen < maxlen; i++) {
++                const SSL_CIPHER *c;
++                int already_selected = 0;
++                size_t pos;
++
++                c = sk_SSL_CIPHER_value(sk, i);
++                for (pos = 0; pos + 1 < selected_len; pos += 2) {
++                    uint16_t selected_id = ((uint16_t)selected[pos] << 8)
++                        | selected[pos + 1];
++                    if (selected_id == SSL_CIPHER_get_protocol_id(c)) {
++                        already_selected = 1;
++                        break;
++                    }
++                }
++                if (already_selected
++                    || ssl_cipher_disabled(s, c, SSL_SECOP_CIPHER_SUPPORTED, 0))
++                    continue;
++                if (!ssl->method->put_cipher_by_char(c, pkt, &len)) {
++                    OPENSSL_free(selected);
++                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                    return 0;
++                }
++                if (!maxverok) {
++                    int minproto = SSL_CONNECTION_IS_DTLS(s) ? c->min_dtls : c->min_tls;
++                    int maxproto = SSL_CONNECTION_IS_DTLS(s) ? c->max_dtls : c->max_tls;
+ 
+-        if (!ssl->method->put_cipher_by_char(c, pkt, &len)) {
+-            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+-            return 0;
++                    if (ssl_version_cmp(s, maxproto, s->s3.tmp.max_ver) >= 0
++                        && ssl_version_cmp(s, minproto, s->s3.tmp.max_ver) <= 0)
++                        maxverok = 1;
++                }
++                totlen += len;
++                if (selected_len + 2 > selected_cap) {
++                    size_t next_cap = selected_cap == 0 ? 32 : selected_cap * 2;
++                    unsigned char *next = OPENSSL_realloc(selected,
++                        next_cap * sizeof(*selected));
++
++                    if (next == NULL) {
++                        OPENSSL_free(selected);
++                        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                        return 0;
++                    }
++                    selected = next;
++                    selected_cap = next_cap;
++                }
++                selected[selected_len++] = (unsigned char)(SSL_CIPHER_get_protocol_id(c) >> 8);
++                selected[selected_len++] = (unsigned char)(SSL_CIPHER_get_protocol_id(c) & 0xff);
++            }
+         }
++        /* JA4 EXACT-mode: raw cipher writes don't carry SSL_CIPHER objects,
++         * so the maxverok min/max-version check above never fires for them.
++         * If the user explicitly told us to send these bytes and we did,
++         * accept the version-set as covered by their explicit choice — the
++         * worst case is a TLS alert from the server, not a local crash. */
++        if (ja4_cipher_mode == OSSL_JA4_MODE_EXACT && totlen > 0)
++            maxverok = 1;
++    } else {
++        for (i = 0; i < sk_SSL_CIPHER_num(sk) && totlen < maxlen; i++) {
++            const SSL_CIPHER *c;
+ 
+-        /* Sanity check that the maximum version we offer has ciphers enabled */
+-        if (!maxverok) {
+-            int minproto = SSL_CONNECTION_IS_DTLS(s) ? c->min_dtls : c->min_tls;
+-            int maxproto = SSL_CONNECTION_IS_DTLS(s) ? c->max_dtls : c->max_tls;
++            c = sk_SSL_CIPHER_value(sk, i);
+ 
+-            if (ssl_version_cmp(s, maxproto, s->s3.tmp.max_ver) >= 0
+-                && ssl_version_cmp(s, minproto, s->s3.tmp.max_ver) <= 0)
+-                maxverok = 1;
+-        }
++            /* Skip disabled ciphers */
++            if (ssl_cipher_disabled(s, c, SSL_SECOP_CIPHER_SUPPORTED, 0))
++                continue;
+ 
+-        totlen += len;
++            if (!ssl->method->put_cipher_by_char(c, pkt, &len)) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                return 0;
++            }
++
++            /* Sanity check that the maximum version we offer has ciphers enabled */
++            if (!maxverok) {
++                int minproto = SSL_CONNECTION_IS_DTLS(s) ? c->min_dtls : c->min_tls;
++                int maxproto = SSL_CONNECTION_IS_DTLS(s) ? c->max_dtls : c->max_tls;
++
++                if (ssl_version_cmp(s, maxproto, s->s3.tmp.max_ver) >= 0
++                    && ssl_version_cmp(s, minproto, s->s3.tmp.max_ver) <= 0)
++                    maxverok = 1;
++            }
++
++            totlen += len;
++            if (selected_len + 2 > selected_cap) {
++                size_t next_cap = selected_cap == 0 ? 32 : selected_cap * 2;
++                unsigned char *next = OPENSSL_realloc(selected,
++                    next_cap * sizeof(*selected));
++
++                if (next == NULL) {
++                    OPENSSL_free(selected);
++                    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++                    return 0;
++                }
++                selected = next;
++                selected_cap = next_cap;
++            }
++            selected[selected_len++] = (unsigned char)(SSL_CIPHER_get_protocol_id(c) >> 8);
++            selected[selected_len++] = (unsigned char)(SSL_CIPHER_get_protocol_id(c) & 0xff);
++        }
+     }
+ 
+     if (totlen == 0 || !maxverok) {
+@@ -4204,6 +4439,7 @@ int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
+             ? "No ciphers enabled for max supported SSL/TLS version"
+             : NULL;
+ 
++        OPENSSL_free(selected);
+         SSLfatal_data(s, SSL_AD_INTERNAL_ERROR, SSL_R_NO_CIPHERS_AVAILABLE,
+             maxvertext);
+         return 0;
+@@ -4230,6 +4466,13 @@ int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
+         }
+     }
+ 
++    for (i = 0; i + 1 < (int)selected_len; i += 2) {
++        uint16_t selected_id = ((uint16_t)selected[i] << 8) | selected[i + 1];
++
++        ossl_ja4_note_cipher(selected_id);
++    }
++    OPENSSL_free(selected);
++
+     return 1;
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

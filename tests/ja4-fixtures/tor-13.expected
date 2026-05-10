@@ -1,0 +1,8 @@
+# Expected dump assertions for tor-13.conf.
+# ja4-fixture-format: v1
+expected_ja4=t13d1713h2_5b57614c22b0_283e4ebb28d0
+mismatch_mask=0
+apply_ok=1
+require_requested_eq_final=cipher_suites,alpn,signature_algorithms,extension_order,supported_versions,supported_groups,key_share_groups,psk_key_exchange_modes
+require_dump_keys_match_schema=1
+require_grease_value=2570

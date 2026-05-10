@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "profile_id": "captured-1777299059973",
+  "metadata": {
+    "name": "Apple Mail",
+    "source": "captured",
+    "captured_at": "2026-04-27T16:10:59.973185",
+    "icon_url": "https://upload.wikimedia.org/wikipedia/commons/4/4e/Mail_%28iOS%29.svg",
+    "version": "16.0 (3864.500.181)"
+  },
+  "inputs": {
+    "tls_client_hello": {
+      "tls_min_version": "1.0",
+      "tls_max_version": "1.0",
+      "cipher_suites": [
+        49162,
+        49161,
+        49172,
+        49171,
+        53,
+        47,
+        49160,
+        49170,
+        10,
+        22016
+      ],
+      "alpn_protocols": [
+        "h2",
+        "http/1.1"
+      ],
+      "extensions": [
+        0,
+        23,
+        65281,
+        10,
+        11,
+        16,
+        5,
+        18
+      ],
+      "signature_algorithms": [],
+      "supported_versions": [],
+      "supported_groups": [],
+      "key_share_groups": [],
+      "psk_key_exchange_modes": [],
+      "enable_grease": false,
+      "enable_ch_xtn_permutation": false,
+      "sni_mode": "present"
+    }
+  }
+}

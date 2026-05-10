@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "profile_id": "captured-1777552867006",
+  "metadata": {
+    "name": "Chromium",
+    "source": "captured",
+    "captured_at": "2026-04-30T14:41:07.006591",
+    "icon_url": "https://upload.wikimedia.org/wikipedia/commons/2/28/Chromium_Logo.svg",
+    "version": "149.0.7811.0 (Developer Build) (arm64)"
+  },
+  "inputs": {
+    "tls_client_hello": {
+      "tls_min_version": "1.2",
+      "tls_max_version": "1.3",
+      "cipher_suites": [
+        4865,
+        4866,
+        4867,
+        49195,
+        49199,
+        49196,
+        49200,
+        52393,
+        52392,
+        49171,
+        49172,
+        156,
+        157,
+        47,
+        53
+      ],
+      "alpn_protocols": [
+        "h2",
+        "http/1.1"
+      ],
+      "extensions": [
+        65037,
+        11,
+        5,
+        27,
+        13,
+        16,
+        45,
+        0,
+        51764,
+        35,
+        18,
+        43,
+        17613,
+        10,
+        23,
+        65281,
+        51
+      ],
+      "signature_algorithms": [
+        1027,
+        2052,
+        1025,
+        1283,
+        2053,
+        1281,
+        2054,
+        1537
+      ],
+      "supported_versions": [],
+      "supported_groups": [],
+      "key_share_groups": [],
+      "psk_key_exchange_modes": [],
+      "enable_grease": true,
+      "enable_ch_xtn_permutation": false,
+      "sni_mode": "present"
+    }
+  }
+}

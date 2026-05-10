@@ -1,0 +1,2562 @@
+From 94a204ca747de2d8869d51b464a7c1027290a62f Mon Sep 17 00:00:00 2001
+From: Niko Burkert <nurkert@local>
+Date: Sun, 10 May 2026 13:43:26 +0200
+Subject: [PATCH] add JA4 ClientHello spoofing for BoringSSL
+
+---
+ gen/sources.gni             |    8 +
+ rust/bssl-macros/Cargo.toml |    7 +
+ rust/bssl-macros/src/lib.rs |   55 +
+ ssl/extensions.cc           | 1939 ++++++++++++++++++++++++++++++++++-
+ ssl/handshake_client.cc     |   72 +-
+ ssl/internal.h              |   98 +-
+ ssl/ssl_versions.cc         |   32 +
+ 7 files changed, 2174 insertions(+), 37 deletions(-)
+ create mode 100644 rust/bssl-macros/Cargo.toml
+ create mode 100644 rust/bssl-macros/src/lib.rs
+
+diff --git a/gen/sources.gni b/gen/sources.gni
+index eb8306084..1400217dc 100644
+--- a/gen/sources.gni
++++ b/gen/sources.gni
+@@ -2971,3 +2971,11 @@ test_support_sources_nasm = [
+ urandom_test_sources = [
+   "crypto/rand/urandom_test.cc",
+ ]
++
++# Added for Chromium build compatibility — bssl-macros copied from
++# src.chromium-orig (Chromium's pinned BoringSSL commit), needed by the
++# newer Chromium third_party/boringssl/BUILD.gn that references
++# rust_bssl_macros_sources.
++rust_bssl_macros_sources = [
++  "rust/bssl-macros/src/lib.rs",
++]
+diff --git a/rust/bssl-macros/Cargo.toml b/rust/bssl-macros/Cargo.toml
+new file mode 100644
+index 000000000..61012aacd
+--- /dev/null
++++ b/rust/bssl-macros/Cargo.toml
+@@ -0,0 +1,7 @@
++[package]
++name = "bssl-macros"
++version = "0.1.0"
++edition = "2024"
++license = "Apache-2.0"
++
++[dependencies]
+diff --git a/rust/bssl-macros/src/lib.rs b/rust/bssl-macros/src/lib.rs
+new file mode 100644
+index 000000000..905f6a753
+--- /dev/null
++++ b/rust/bssl-macros/src/lib.rs
+@@ -0,0 +1,55 @@
++// Copyright 2026 The BoringSSL Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#[doc(hidden)]
++#[macro_export]
++macro_rules! bssl_enum {
++    (
++        $(#[$attr:meta])*
++        $vis:vis enum $name:ident : $repr:ty {
++            $(
++                $(#[$vattr:meta])*
++                $item:ident = $e:expr
++            ),* $(,)?
++        }
++    ) => {
++        $(#[$attr])*
++        #[repr($repr)]
++        $vis enum $name {
++            $(
++                $(#[$vattr])*
++                $item = $e,
++            )*
++        }
++
++        impl ::core::convert::TryFrom<$repr> for $name {
++            type Error = $repr;
++
++            fn try_from(value: $repr) -> Result<Self, Self::Error> {
++                $(
++                    #[allow(non_upper_case_globals)]
++                    const $item: $repr = $e;
++                )*
++
++                #[allow(non_upper_case_globals)]
++                match value {
++                    $(
++                        $item => ::core::result::Result::Ok(Self::$item),
++                    )*
++                    _ => ::core::result::Result::Err(value),
++                }
++            }
++        }
++    };
++}
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 077acb418..726f0fc94 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -15,13 +15,18 @@
+ #include <openssl/ssl.h>
+ 
+ #include <assert.h>
++#include <ctype.h>
+ #include <limits.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+ #include <algorithm>
+ #include <optional>
++#include <string>
++#include <string_view>
+ #include <utility>
++#include <vector>
+ 
+ #include <openssl/aead.h>
+ #include <openssl/bytestring.h>
+@@ -47,6 +52,1266 @@ BSSL_NAMESPACE_BEGIN
+ static bool ssl_check_clienthello_tlsext(SSL_HANDSHAKE *hs);
+ static bool ssl_check_serverhello_tlsext(SSL_HANDSHAKE *hs);
+ 
++static std::string_view ja4_trim(std::string_view value) {
++  size_t begin = 0;
++  while (begin < value.size() && isspace(static_cast<unsigned char>(value[begin]))) {
++    begin++;
++  }
++  size_t end = value.size();
++  while (end > begin && isspace(static_cast<unsigned char>(value[end - 1]))) {
++    end--;
++  }
++  return value.substr(begin, end - begin);
++}
++
++static std::string ja4_to_lower(std::string_view value) {
++  std::string out;
++  out.reserve(value.size());
++  for (char c : value) {
++    out.push_back(static_cast<char>(tolower(static_cast<unsigned char>(c))));
++  }
++  return out;
++}
++
++static bool ja4_parse_bool(std::string_view value, bool *out) {
++  const std::string lowered = ja4_to_lower(ja4_trim(value));
++  if (lowered == "1" || lowered == "true" || lowered == "yes" ||
++      lowered == "on") {
++    *out = true;
++    return true;
++  }
++  if (lowered == "0" || lowered == "false" || lowered == "no" ||
++      lowered == "off") {
++    *out = false;
++    return true;
++  }
++  return false;
++}
++
++static bool ja4_parse_mode(std::string_view value, ssl_ja4_mode_t *out) {
++  const std::string lowered = ja4_to_lower(ja4_trim(value));
++  if (lowered == "reorder") {
++    *out = ssl_ja4_mode_reorder;
++    return true;
++  }
++  if (lowered == "exact") {
++    *out = ssl_ja4_mode_exact;
++    return true;
++  }
++  return false;
++}
++
++static bool ja4_parse_sni_mode(std::string_view value, ssl_ja4_sni_mode_t *out) {
++  const std::string lowered = ja4_to_lower(ja4_trim(value));
++  if (lowered == "present") {
++    *out = ssl_ja4_sni_present;
++    return true;
++  }
++  if (lowered == "domain") {
++    *out = ssl_ja4_sni_domain;
++    return true;
++  }
++  if (lowered == "none") {
++    *out = ssl_ja4_sni_none;
++    return true;
++  }
++  if (lowered == "ip") {
++    *out = ssl_ja4_sni_ip;
++    return true;
++  }
++  return false;
++}
++
++static bool ja4_parse_tls_version(std::string_view value, uint16_t *out) {
++  const std::string trimmed(ja4_trim(value));
++  if (trimmed == "1.0") {
++    *out = TLS1_VERSION;
++    return true;
++  }
++  if (trimmed == "1.1") {
++    *out = TLS1_1_VERSION;
++    return true;
++  }
++  if (trimmed == "1.2") {
++    *out = TLS1_2_VERSION;
++    return true;
++  }
++  if (trimmed == "1.3") {
++    *out = TLS1_3_VERSION;
++    return true;
++  }
++
++  char *end = nullptr;
++  const unsigned long parsed = strtoul(trimmed.c_str(), &end, 0);
++  if (end != nullptr && *end == '\0' && parsed <= UINT16_MAX) {
++    *out = static_cast<uint16_t>(parsed);
++    return true;
++  }
++
++  return false;
++}
++
++template <typename T>
++static bool ja4_copy_vector_to_array(const std::vector<T> &in, Array<T> *out) {
++  if (in.empty()) {
++    out->Reset();
++    return true;
++  }
++  return out->CopyFrom(Span<const T>(in.data(), in.size()));
++}
++
++static bool ja4_parse_csv_u16(std::string_view value, Array<uint16_t> *out) {
++  const std::string input(ja4_trim(value));
++  if (input.empty()) {
++    out->Reset();
++    return true;
++  }
++
++  std::vector<uint16_t> parsed;
++  size_t begin = 0;
++  while (begin <= input.size()) {
++    const size_t end = input.find(',', begin);
++    const size_t token_len =
++        (end == std::string::npos ? input.size() : end) - begin;
++    std::string_view token(input.data() + begin, token_len);
++    token = ja4_trim(token);
++    if (token.empty()) {
++      return false;
++    }
++
++    const std::string token_string(token);
++    char *tail = nullptr;
++    const unsigned long item = strtoul(token_string.c_str(), &tail, 0);
++    if (tail == nullptr || *tail != '\0' || item > UINT16_MAX) {
++      return false;
++    }
++    parsed.push_back(static_cast<uint16_t>(item));
++
++    if (end == std::string::npos) {
++      break;
++    }
++    begin = end + 1;
++  }
++
++  return ja4_copy_vector_to_array(parsed, out);
++}
++
++static bool ja4_parse_csv_u8(std::string_view value, Array<uint8_t> *out) {
++  const std::string input(ja4_trim(value));
++  if (input.empty()) {
++    out->Reset();
++    return true;
++  }
++
++  std::vector<uint8_t> parsed;
++  size_t begin = 0;
++  while (begin <= input.size()) {
++    const size_t end = input.find(',', begin);
++    const size_t token_len =
++        (end == std::string::npos ? input.size() : end) - begin;
++    std::string_view token(input.data() + begin, token_len);
++    token = ja4_trim(token);
++    if (token.empty()) {
++      return false;
++    }
++
++    const std::string token_string(token);
++    char *tail = nullptr;
++    const unsigned long item = strtoul(token_string.c_str(), &tail, 0);
++    if (tail == nullptr || *tail != '\0' || item > UINT8_MAX) {
++      return false;
++    }
++    parsed.push_back(static_cast<uint8_t>(item));
++
++    if (end == std::string::npos) {
++      break;
++    }
++    begin = end + 1;
++  }
++
++  return ja4_copy_vector_to_array(parsed, out);
++}
++
++static bool ja4_parse_alpn_wire(std::string_view value, Array<uint8_t> *out) {
++  const std::string input(ja4_trim(value));
++  if (input.empty()) {
++    out->Reset();
++    return true;
++  }
++
++  std::vector<uint8_t> wire;
++  size_t begin = 0;
++  while (begin <= input.size()) {
++    const size_t end = input.find(',', begin);
++    const size_t token_len =
++        (end == std::string::npos ? input.size() : end) - begin;
++    std::string_view token(input.data() + begin, token_len);
++    token = ja4_trim(token);
++    if (token.empty() || token.size() > UINT8_MAX ||
++        token.find(',') != std::string::npos) {
++      return false;
++    }
++    wire.push_back(static_cast<uint8_t>(token.size()));
++    wire.insert(wire.end(), token.begin(), token.end());
++
++    if (end == std::string::npos) {
++      break;
++    }
++    begin = end + 1;
++  }
++
++  return ja4_copy_vector_to_array(wire, out);
++}
++
++static bool ja4_array_contains_u16(Span<const uint16_t> values, uint16_t value) {
++  return std::find(values.begin(), values.end(), value) != values.end();
++}
++
++// ja4_is_grease_value: GREASE values per RFC 8701 follow the pattern 0x?A?A
++// (low nibble of each byte == 0xA, both bytes equal). The TLS 1.3 GREASE
++// table is {0x0A0A, 0x1A1A, ..., 0xFAFA}.
++static bool ja4_is_grease_value(uint16_t v) {
++  return ((v & 0x0F0F) == 0x0A0A) && ((v >> 8) == (v & 0xFF));
++}
++
++// ja4_arrays_equal_u16_modulo_grease: |b| (final-side wire reparse) may carry
++// extra GREASE entries that |a| (user-supplied requested list) does not. Strip
++// any GREASE-pattern entries from both before comparing. Used for the wire
++// shapes that mix in GREASE during serialization (cipher_suites,
++// supported_groups, supported_versions, key_share_groups).
++static bool ja4_arrays_equal_u16_modulo_grease(Span<const uint16_t> a,
++                                               Span<const uint16_t> b) {
++  std::vector<uint16_t> fa, fb;
++  fa.reserve(a.size());
++  fb.reserve(b.size());
++  for (uint16_t v : a) {
++    if (!ja4_is_grease_value(v)) {
++      fa.push_back(v);
++    }
++  }
++  for (uint16_t v : b) {
++    if (!ja4_is_grease_value(v)) {
++      fb.push_back(v);
++    }
++  }
++  return fa == fb;
++}
++
++static bool ja4_arrays_equal_u8(Span<const uint8_t> a,
++                                Span<const uint8_t> b) {
++  return a.size() == b.size() &&
++         std::equal(a.begin(), a.end(), b.begin());
++}
++
++static bool ja4_extension_lists_equal_modulo_psk(Span<const uint16_t> a,
++                                                 Span<const uint16_t> b) {
++  // Compare extension lists ignoring pre_shared_key (normalized to last
++  // position by the runtime), GREASE entries (added on the wire by the
++  // serializer for fingerprint diversity), and the trailing F5-padding
++  // extension (TLSEXT_TYPE_padding == 21) when it appears at the wire tail
++  // for the WebSphere/F5 bug workaround. Two lists are equivalent if they
++  // agree on order after these filters.
++  auto is_trailing_padding = [](Span<const uint16_t> list, size_t i) -> bool {
++    if (list[i] != TLSEXT_TYPE_padding) {
++      return false;
++    }
++    for (size_t j = i + 1; j < list.size(); j++) {
++      if (list[j] != TLSEXT_TYPE_padding && !ja4_is_grease_value(list[j])) {
++        return false;
++      }
++    }
++    return true;
++  };
++  auto filter = [&](Span<const uint16_t> in) -> std::vector<uint16_t> {
++    std::vector<uint16_t> out;
++    out.reserve(in.size());
++    for (size_t i = 0; i < in.size(); i++) {
++      uint16_t v = in[i];
++      if (v == TLSEXT_TYPE_pre_shared_key || ja4_is_grease_value(v)) {
++        continue;
++      }
++      if (is_trailing_padding(in, i)) {
++        continue;
++      }
++      out.push_back(v);
++    }
++    return out;
++  };
++  return filter(a) == filter(b);
++}
++
++static bool ja4_append_u16(Array<uint16_t> *values, uint16_t value) {
++  Array<uint16_t> next;
++  if (!next.InitForOverwrite(values->size() + 1)) {
++    return false;
++  }
++  if (!values->empty()) {
++    OPENSSL_memcpy(next.data(), values->data(), values->size() * sizeof(uint16_t));
++  }
++  next[values->size()] = value;
++  *values = std::move(next);
++  return true;
++}
++
++static bool ja4_append_u8(Array<uint8_t> *values, uint8_t value) {
++  Array<uint8_t> next;
++  if (!next.InitForOverwrite(values->size() + 1)) {
++    return false;
++  }
++  if (!values->empty()) {
++    OPENSSL_memcpy(next.data(), values->data(), values->size());
++  }
++  next[values->size()] = value;
++  *values = std::move(next);
++  return true;
++}
++
++static bool ja4_insert_u16_at(Array<uint16_t> *values, size_t index,
++                              uint16_t value) {
++  if (index > values->size()) {
++    index = values->size();
++  }
++
++  Array<uint16_t> next;
++  if (!next.InitForOverwrite(values->size() + 1)) {
++    return false;
++  }
++
++  for (size_t i = 0, src = 0; i < next.size(); i++) {
++    if (i == index) {
++      next[i] = value;
++      continue;
++    }
++    next[i] = (*values)[src++];
++  }
++  *values = std::move(next);
++  return true;
++}
++
++static bool ja4_find_u16_index(Span<const uint16_t> values, uint16_t needle,
++                               size_t *out_index) {
++  for (size_t i = 0; i < values.size(); i++) {
++    if (values[i] == needle) {
++      *out_index = i;
++      return true;
++    }
++  }
++  return false;
++}
++
++static bool ja4_remove_all_u16(Array<uint16_t> *values, uint16_t needle) {
++  size_t keep_count = 0;
++  for (uint16_t value : *values) {
++    if (value != needle) {
++      keep_count++;
++    }
++  }
++  if (keep_count == values->size()) {
++    return true;
++  }
++  Array<uint16_t> next;
++  if (!next.InitForOverwrite(keep_count)) {
++    return false;
++  }
++  size_t dst = 0;
++  for (uint16_t value : *values) {
++    if (value != needle) {
++      next[dst++] = value;
++    }
++  }
++  *values = std::move(next);
++  return true;
++}
++
++static bool ja4_dedupe_u16(Array<uint16_t> *values) {
++  if (values->size() < 2) {
++    return true;
++  }
++  std::vector<uint16_t> deduped;
++  deduped.reserve(values->size());
++  for (uint16_t value : *values) {
++    if (std::find(deduped.begin(), deduped.end(), value) == deduped.end()) {
++      deduped.push_back(value);
++    }
++  }
++  if (deduped.size() == values->size()) {
++    return true;
++  }
++  return ja4_copy_vector_to_array(deduped, values);
++}
++
++static void ssl_ja4_reset_config(SSLJA4Config *cfg) {
++  cfg->active = false;
++  cfg->strict_set = false;
++  cfg->strict_enabled = false;
++  cfg->tls_min_set = false;
++  cfg->tls_min = 0;
++  cfg->tls_max_set = false;
++  cfg->tls_max = 0;
++  cfg->cipher_suites.Reset();
++  cfg->cipher_mode = ssl_ja4_mode_none;
++  cfg->alpn_wire.Reset();
++  cfg->signature_algorithms.Reset();
++  cfg->supported_versions.Reset();
++  cfg->supported_groups.Reset();
++  cfg->key_share_groups.Reset();
++  cfg->psk_key_exchange_modes.Reset();
++  cfg->extension_order.Reset();
++  cfg->extension_mode = ssl_ja4_mode_none;
++  cfg->sni_mode = ssl_ja4_sni_unset;
++  cfg->grease_set = false;
++  cfg->grease_enabled = false;
++  cfg->grease_value_set = false;
++  cfg->grease_value = 0;
++  cfg->enable_ch_xtn_permutation_set = false;
++  cfg->enable_ch_xtn_permutation = false;
++  cfg->apply_ok = true;
++  cfg->mismatch_mask = 0;
++  cfg->parsed_once = false;
++  cfg->final_cipher_suites.Reset();
++  cfg->final_signature_algorithms.Reset();
++  cfg->final_extensions.Reset();
++  cfg->final_supported_versions.Reset();
++  cfg->final_supported_groups.Reset();
++  cfg->final_key_share_groups.Reset();
++  cfg->final_psk_key_exchange_modes.Reset();
++  cfg->synthetic_sent.Reset();
++}
++
++static bool ssl_ja4_require_extension(SSLJA4Config *cfg, uint16_t extension_type,
++                                      size_t insert_pos) {
++  if (ja4_array_contains_u16(cfg->extension_order, extension_type)) {
++    return true;
++  }
++  // Silently append the dependency in every mode. TLS 1.3 wire emission has
++  // mandatory deps the user can't reasonably opt out of (e.g. ALPN data is
++  // configured separately from extension_order; signature_algorithms has to
++  // ride alongside its values; psk_key_exchange_modes likewise). Treating a
++  // missing dep as drift would force fixtures to duplicate every implicit ID,
++  // which is the kind of cross-library churn we explicitly want to avoid.
++  return ja4_insert_u16_at(&cfg->extension_order, insert_pos, extension_type);
++}
++
++static bool ssl_ja4_normalize_psk_extension_position(SSLJA4Config *cfg) {
++  size_t first_psk_index = 0;
++  if (!ja4_find_u16_index(cfg->extension_order, TLSEXT_TYPE_pre_shared_key,
++                          &first_psk_index)) {
++    return true;
++  }
++  const bool already_last = first_psk_index + 1 == cfg->extension_order.size();
++  if (already_last) {
++    return true;
++  }
++  cfg->apply_ok = false;
++  cfg->mismatch_mask |= ssl_ja4_mismatch_invalid_config;
++  if (cfg->strict_enabled) {
++    return false;
++  }
++  if (!ja4_remove_all_u16(&cfg->extension_order, TLSEXT_TYPE_pre_shared_key)) {
++    return false;
++  }
++  return ja4_append_u16(&cfg->extension_order, TLSEXT_TYPE_pre_shared_key);
++}
++
++static bool ssl_ja4_normalize_extension_order(SSLJA4Config *cfg) {
++  if (cfg->extension_mode != ssl_ja4_mode_exact || cfg->extension_order.empty()) {
++    return true;
++  }
++
++  const size_t before_dedupe = cfg->extension_order.size();
++  if (!ja4_dedupe_u16(&cfg->extension_order)) {
++    return false;
++  }
++  if (cfg->extension_order.size() != before_dedupe) {
++    cfg->apply_ok = false;
++    cfg->mismatch_mask |= ssl_ja4_mismatch_invalid_config;
++    if (cfg->strict_enabled) {
++      return false;
++    }
++  }
++
++  if (!ssl_ja4_normalize_psk_extension_position(cfg)) {
++    return false;
++  }
++
++  if (cfg->sni_mode != ssl_ja4_sni_none && cfg->sni_mode != ssl_ja4_sni_ip &&
++      !ssl_ja4_require_extension(cfg, TLSEXT_TYPE_server_name, 0)) {
++    return false;
++  }
++
++  size_t sigalgs_index = 0;
++  const bool sigalgs_requested = ja4_find_u16_index(
++      cfg->extension_order, TLSEXT_TYPE_signature_algorithms, &sigalgs_index);
++
++  if (!cfg->alpn_wire.empty()) {
++    const size_t alpn_insert_pos =
++        sigalgs_requested ? sigalgs_index + 1 : cfg->extension_order.size();
++    if (!ssl_ja4_require_extension(
++            cfg, TLSEXT_TYPE_application_layer_protocol_negotiation,
++            alpn_insert_pos)) {
++      return false;
++    }
++  }
++
++  if (!cfg->signature_algorithms.empty() &&
++      !ssl_ja4_require_extension(cfg, TLSEXT_TYPE_signature_algorithms,
++                                 cfg->extension_order.size())) {
++    return false;
++  }
++  if ((!cfg->supported_groups.empty() || !cfg->key_share_groups.empty()) &&
++      !ssl_ja4_require_extension(cfg, TLSEXT_TYPE_supported_groups,
++                                 cfg->extension_order.size())) {
++    return false;
++  }
++  if (!cfg->key_share_groups.empty() &&
++      !ssl_ja4_require_extension(cfg, TLSEXT_TYPE_key_share,
++                                 cfg->extension_order.size())) {
++    return false;
++  }
++  if (!cfg->supported_versions.empty() &&
++      !ssl_ja4_require_extension(cfg, TLSEXT_TYPE_supported_versions,
++                                 cfg->extension_order.size())) {
++    return false;
++  }
++  // psk_key_exchange_modes auto-rides whenever the user supplied a non-empty
++  // modes list, mirroring OpenSSL/NSS behaviour. The 45 extension is always
++  // emitted with that data; reflecting the implicit ID in |extension_order|
++  // keeps requested/final byte-equal so cross-lib comparators agree.
++  if (!cfg->psk_key_exchange_modes.empty() &&
++      !ssl_ja4_require_extension(cfg, TLSEXT_TYPE_psk_key_exchange_modes,
++                                 cfg->extension_order.size())) {
++    return false;
++  }
++
++  if ((cfg->sni_mode == ssl_ja4_sni_none || cfg->sni_mode == ssl_ja4_sni_ip) &&
++      ja4_array_contains_u16(cfg->extension_order, TLSEXT_TYPE_server_name)) {
++    cfg->apply_ok = false;
++    cfg->mismatch_mask |= ssl_ja4_mismatch_missing_extension;
++    if (cfg->strict_enabled) {
++      return false;
++    }
++  }
++
++  return true;
++}
++
++static void ssl_ja4_parse_file(SSL_HANDSHAKE *hs, const char *path) {
++  FILE *file = fopen(path, "r");
++  if (file == nullptr) {
++    return;
++  }
++
++  SSLJA4Config *cfg = &hs->ja4;
++  char line[4096];
++  while (fgets(line, sizeof(line), file) != nullptr) {
++    std::string_view raw(line);
++    raw = ja4_trim(raw);
++    if (raw.empty() || raw[0] == '#') {
++      continue;
++    }
++
++    const size_t split = raw.find('=');
++    if (split == std::string::npos) {
++      continue;
++    }
++
++    const std::string key(ja4_trim(raw.substr(0, split)));
++    const std::string_view value = ja4_trim(raw.substr(split + 1));
++    if (key.empty()) {
++      continue;
++    }
++
++    bool ok = true;
++    bool unknown_key = false;
++    if (key == "strict") {
++      bool parsed = false;
++      ok = ja4_parse_bool(value, &parsed);
++      if (ok) {
++        cfg->strict_set = true;
++        cfg->strict_enabled = parsed;
++        cfg->active = true;
++      }
++    } else if (key == "tls_min") {
++      uint16_t parsed = 0;
++      ok = ja4_parse_tls_version(value, &parsed);
++      if (ok) {
++        cfg->tls_min_set = true;
++        cfg->tls_min = parsed;
++        cfg->active = true;
++      }
++    } else if (key == "tls_max") {
++      uint16_t parsed = 0;
++      ok = ja4_parse_tls_version(value, &parsed);
++      if (ok) {
++        cfg->tls_max_set = true;
++        cfg->tls_max = parsed;
++        cfg->active = true;
++      }
++    } else if (key == "cipher_suites") {
++      ok = ja4_parse_csv_u16(value, &cfg->cipher_suites);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "cipher_mode") {
++      ok = ja4_parse_mode(value, &cfg->cipher_mode);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "alpn") {
++      ok = ja4_parse_alpn_wire(value, &cfg->alpn_wire);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "signature_algorithms") {
++      ok = ja4_parse_csv_u16(value, &cfg->signature_algorithms);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "supported_versions") {
++      ok = ja4_parse_csv_u16(value, &cfg->supported_versions);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "supported_groups") {
++      ok = ja4_parse_csv_u16(value, &cfg->supported_groups);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "key_share_groups") {
++      ok = ja4_parse_csv_u16(value, &cfg->key_share_groups);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "psk_key_exchange_modes") {
++      ok = ja4_parse_csv_u8(value, &cfg->psk_key_exchange_modes);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "extension_order") {
++      ok = ja4_parse_csv_u16(value, &cfg->extension_order);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "extension_mode") {
++      ok = ja4_parse_mode(value, &cfg->extension_mode);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "sni_mode") {
++      ok = ja4_parse_sni_mode(value, &cfg->sni_mode);
++      if (ok) {
++        cfg->active = true;
++      }
++    } else if (key == "enable_grease") {
++      bool parsed = false;
++      ok = ja4_parse_bool(value, &parsed);
++      if (ok) {
++        cfg->grease_set = true;
++        cfg->grease_enabled = parsed;
++        cfg->active = true;
++      }
++    } else if (key == "enable_ch_xtn_permutation") {
++      bool parsed = false;
++      ok = ja4_parse_bool(value, &parsed);
++      if (ok) {
++        cfg->enable_ch_xtn_permutation_set = true;
++        cfg->enable_ch_xtn_permutation = parsed;
++        cfg->active = true;
++      }
++    } else if (key == "grease_value") {
++      uint16_t parsed = 0;
++      ok = ja4_parse_tls_version(value, &parsed);
++      if (ok) {
++        cfg->grease_value_set = true;
++        cfg->grease_value = parsed;
++        cfg->active = true;
++      }
++    } else {
++      ok = false;
++      unknown_key = true;
++    }
++
++    if (!ok) {
++      cfg->apply_ok = false;
++      cfg->mismatch_mask |= unknown_key ? ssl_ja4_mismatch_unknown_key
++                                        : ssl_ja4_mismatch_parse;
++      if (cfg->strict_set && cfg->strict_enabled) {
++        break;
++      }
++    }
++  }
++
++  fclose(file);
++}
++
++static bool ssl_ja4_validate_config(SSL_HANDSHAKE *hs) {
++  SSLJA4Config *cfg = &hs->ja4;
++  bool ok = true;
++
++  if (cfg->cipher_mode == ssl_ja4_mode_exact && cfg->cipher_suites.empty()) {
++    cfg->apply_ok = false;
++    cfg->mismatch_mask |= ssl_ja4_mismatch_invalid_config;
++    ok = false;
++  }
++
++  if (cfg->extension_mode == ssl_ja4_mode_exact &&
++      cfg->extension_order.empty()) {
++    cfg->apply_ok = false;
++    cfg->mismatch_mask |= ssl_ja4_mismatch_invalid_config;
++    ok = false;
++  }
++
++  if (cfg->tls_min_set && cfg->tls_max_set && cfg->tls_min > cfg->tls_max) {
++    cfg->apply_ok = false;
++    cfg->mismatch_mask |= ssl_ja4_mismatch_invalid_config;
++    ok = false;
++  }
++
++  return ok || !cfg->strict_enabled;
++}
++
++bool ssl_ja4_prepare_client_hello(SSL_HANDSHAKE *hs) {
++  ssl_ja4_reset_config(&hs->ja4);
++
++  const char *path = getenv("BORINGSSL_JA4_CONFIG");
++  if (path == nullptr || *path == '\0') {
++    path = getenv("NSS_JA4_CONFIG");
++  }
++  if (path == nullptr || *path == '\0') {
++    return true;
++  }
++
++  ssl_ja4_parse_file(hs, path);
++  hs->ja4.parsed_once = true;
++  if (!hs->ja4.active) {
++    return true;
++  }
++
++  if (!ssl_ja4_validate_config(hs)) {
++    return false;
++  }
++
++  if (!ssl_ja4_normalize_extension_order(&hs->ja4)) {
++    hs->ja4.apply_ok = false;
++    hs->ja4.mismatch_mask |= ssl_ja4_mismatch_apply;
++    return !hs->ja4.strict_enabled;
++  }
++
++  if (hs->ja4.tls_min_set) {
++    hs->min_version = hs->ja4.tls_min;
++  }
++  if (hs->ja4.tls_max_set) {
++    hs->max_version = hs->ja4.tls_max;
++  }
++  if (hs->min_version > hs->max_version) {
++    hs->ja4.apply_ok = false;
++    hs->ja4.mismatch_mask |= ssl_ja4_mismatch_apply;
++    if (hs->ja4.strict_enabled) {
++      return false;
++    }
++  }
++
++  if (!hs->ja4.alpn_wire.empty() &&
++      !hs->config->alpn_client_proto_list.CopyFrom(hs->ja4.alpn_wire)) {
++    return false;
++  }
++  if (!hs->ja4.signature_algorithms.empty() &&
++      !hs->config->verify_sigalgs.CopyFrom(hs->ja4.signature_algorithms)) {
++    return false;
++  }
++
++  if (!hs->ja4.supported_groups.empty()) {
++    Array<uint32_t> group_flags;
++    if (!group_flags.InitForOverwrite(hs->ja4.supported_groups.size())) {
++      return false;
++    }
++    OPENSSL_memset(group_flags.data(), 0, group_flags.size() * sizeof(uint32_t));
++    if (!hs->config->supported_group_list.CopyFrom(hs->ja4.supported_groups)) {
++      return false;
++    }
++    hs->config->supported_group_list_flags = std::move(group_flags);
++    hs->config->client_key_share_selections.reset();
++  }
++
++  if (!hs->ja4.key_share_groups.empty()) {
++    InplaceVector<uint16_t, kNumNamedGroups> selected;
++    for (uint16_t group_id : hs->ja4.key_share_groups) {
++      if (!ja4_array_contains_u16(hs->config->supported_group_list, group_id)) {
++        hs->ja4.apply_ok = false;
++        hs->ja4.mismatch_mask |= ssl_ja4_mismatch_key_shares;
++        if (hs->ja4.strict_enabled) {
++          return false;
++        }
++        continue;
++      }
++      if (std::find(selected.begin(), selected.end(), group_id) !=
++          selected.end()) {
++        continue;
++      }
++      if (!selected.TryPushBack(group_id)) {
++        return false;
++      }
++    }
++    if (!selected.empty()) {
++      hs->config->client_key_share_selections = std::move(selected);
++    }
++  } else if (!hs->ja4.supported_groups.empty()) {
++    InplaceVector<uint16_t, kNumNamedGroups> selected;
++    for (uint16_t group_id : hs->config->supported_group_list) {
++      if (SSLKeyShare::Create(group_id) == nullptr) {
++        continue;
++      }
++      if (!selected.TryPushBack(group_id)) {
++        return false;
++      }
++      break;
++    }
++    if (!selected.empty()) {
++      hs->config->client_key_share_selections = std::move(selected);
++    }
++  }
++
++  if (hs->ja4.enable_ch_xtn_permutation_set) {
++    hs->config->permute_extensions = hs->ja4.enable_ch_xtn_permutation;
++  }
++
++  // If grease_value is set, seed the GREASE RNG so all GREASE slots produce
++  // deterministic values derived from the requested value.  The formula in
++  // grease_index_to_value() is:
++  //   ret = (seed & 0xf0) | 0x0a;  ret |= ret << 8;
++  // so seed_byte = (grease_value >> 4) & 0xf0 yields the requested 0xωaωa.
++  if (hs->ja4.grease_value_set) {
++    // grease_index_to_value(): ret = (seed & 0xf0) | 0x0a; ret |= ret << 8.
++    // To reproduce 0xωaωa: seed_byte must satisfy (seed_byte & 0xf0) == ω<<4,
++    // so seed_byte = (grease_value >> 8) & 0xf0.
++    const uint8_t seed_byte =
++        static_cast<uint8_t>((hs->ja4.grease_value >> 8) & 0xf0);
++    OPENSSL_memset(hs->grease_seed, seed_byte, sizeof(hs->grease_seed));
++  }
++
++  if (hs->ja4.sni_mode == ssl_ja4_sni_none || hs->ja4.sni_mode == ssl_ja4_sni_ip) {
++    hs->ssl->hostname.reset();
++  } else if ((hs->ja4.sni_mode == ssl_ja4_sni_present ||
++              hs->ja4.sni_mode == ssl_ja4_sni_domain) &&
++             hs->ssl->hostname == nullptr) {
++    hs->ssl->hostname.reset(OPENSSL_strdup("example.com"));
++    if (hs->ssl->hostname == nullptr) {
++      return false;
++    }
++  }
++
++  return !hs->ja4.strict_enabled || hs->ja4.apply_ok;
++}
++
++bool ssl_ja4_should_enable_grease(const SSL_HANDSHAKE *hs) {
++  if (hs->ja4.active && hs->ja4.grease_set) {
++    return hs->ja4.grease_enabled;
++  }
++  return hs->ssl->ctx->grease_enabled;
++}
++
++// Standalone GREASE extension types (TLS extensions whose type itself is a
++// GREASE value, RFC 8701) are emitted only when JA4 is inactive, JA4 mode is
++// not exact, or the configured |extension_order| explicitly includes a GREASE
++// ID. Cross-lib parity requires exact-mode wire output to honor only the IDs
++// listed in the fixture, otherwise BoringSSL's CH adds GREASE markers that
++// drift the JA4 third hash from OpenSSL/NSS.
++bool ssl_ja4_should_emit_standalone_grease_extensions(
++    const SSL_HANDSHAKE *hs) {
++  if (!ssl_ja4_should_enable_grease(hs)) {
++    return false;
++  }
++  if (!hs->ja4.active || hs->ja4.extension_mode != ssl_ja4_mode_exact) {
++    return true;
++  }
++  for (uint16_t v : hs->ja4.extension_order) {
++    if ((v & 0x0F0F) == 0x0A0A && (v >> 8) == (v & 0xFF)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++static bool ssl_ja4_is_extension_requested_exact(const SSL_HANDSHAKE *hs,
++                                                 uint16_t extension_type) {
++  if (!(hs->ja4.active && hs->ja4.extension_mode == ssl_ja4_mode_exact)) {
++    return true;
++  }
++  if (hs->ja4.extension_order.empty()) {
++    return true;
++  }
++  return ja4_array_contains_u16(hs->ja4.extension_order, extension_type);
++}
++
++void ssl_ja4_note_cipher(SSL_HANDSHAKE *hs, uint16_t cipher_id) {
++  (void)ja4_append_u16(&hs->ja4.final_cipher_suites, cipher_id);
++}
++
++void ssl_ja4_note_signature_algorithm(SSL_HANDSHAKE *hs, uint16_t sigalg_id) {
++  (void)ja4_append_u16(&hs->ja4.final_signature_algorithms, sigalg_id);
++}
++
++void ssl_ja4_note_extension(SSL_HANDSHAKE *hs, uint16_t extension_type) {
++  (void)ja4_append_u16(&hs->ja4.final_extensions, extension_type);
++}
++
++void ssl_ja4_note_supported_version(SSL_HANDSHAKE *hs, uint16_t version) {
++  (void)ja4_append_u16(&hs->ja4.final_supported_versions, version);
++}
++
++void ssl_ja4_note_supported_group(SSL_HANDSHAKE *hs, uint16_t group_id) {
++  (void)ja4_append_u16(&hs->ja4.final_supported_groups, group_id);
++}
++
++void ssl_ja4_note_keyshare_group(SSL_HANDSHAKE *hs, uint16_t group_id) {
++  (void)ja4_append_u16(&hs->ja4.final_key_share_groups, group_id);
++}
++
++void ssl_ja4_note_psk_mode(SSL_HANDSHAKE *hs, uint8_t mode) {
++  (void)ja4_append_u8(&hs->ja4.final_psk_key_exchange_modes, mode);
++}
++
++static void ssl_ja4_reset_final_notes(SSL_HANDSHAKE *hs) {
++  hs->ja4.final_cipher_suites.Reset();
++  hs->ja4.final_alpn_wire.Reset();
++  hs->ja4.final_signature_algorithms.Reset();
++  hs->ja4.final_extensions.Reset();
++  hs->ja4.final_supported_versions.Reset();
++  hs->ja4.final_supported_groups.Reset();
++  hs->ja4.final_key_share_groups.Reset();
++  hs->ja4.final_psk_key_exchange_modes.Reset();
++}
++
++void ssl_ja4_capture_client_hello(SSL_HANDSHAKE *hs, Span<const uint8_t> message) {
++  ssl_ja4_reset_final_notes(hs);
++  if (message.size() < SSL3_HM_HEADER_LENGTH || message[0] != SSL3_MT_CLIENT_HELLO) {
++    return;
++  }
++
++  size_t body_len = (static_cast<size_t>(message[1]) << 16) |
++                    (static_cast<size_t>(message[2]) << 8) |
++                    static_cast<size_t>(message[3]);
++  if (body_len + SSL3_HM_HEADER_LENGTH > message.size()) {
++    body_len = message.size() - SSL3_HM_HEADER_LENGTH;
++  }
++
++  CBS body;
++  CBS_init(&body, message.data() + SSL3_HM_HEADER_LENGTH, body_len);
++
++  uint16_t ignored_legacy_version;
++  CBS random, session_id, compression, cipher_suites;
++  if (!CBS_get_u16(&body, &ignored_legacy_version) ||
++      !CBS_get_bytes(&body, &random, SSL3_RANDOM_SIZE) ||
++      !CBS_get_u8_length_prefixed(&body, &session_id)) {
++    return;
++  }
++  if (SSL_is_dtls(hs->ssl)) {
++    CBS cookie;
++    if (!CBS_get_u8_length_prefixed(&body, &cookie)) {
++      return;
++    }
++  }
++  if (!CBS_get_u16_length_prefixed(&body, &cipher_suites) ||
++      !CBS_get_u8_length_prefixed(&body, &compression)) {
++    return;
++  }
++
++  while (CBS_len(&cipher_suites) >= 2) {
++    uint16_t cipher_id;
++    if (!CBS_get_u16(&cipher_suites, &cipher_id)) {
++      return;
++    }
++    ssl_ja4_note_cipher(hs, cipher_id);
++  }
++
++  if (CBS_len(&body) == 0) {
++    return;
++  }
++
++  CBS extensions;
++  if (!CBS_get_u16_length_prefixed(&body, &extensions)) {
++    return;
++  }
++  while (CBS_len(&extensions) > 0) {
++    uint16_t extension_type;
++    CBS extension_body;
++    if (!CBS_get_u16(&extensions, &extension_type) ||
++        !CBS_get_u16_length_prefixed(&extensions, &extension_body)) {
++      return;
++    }
++    ssl_ja4_note_extension(hs, extension_type);
++
++    if (extension_type == TLSEXT_TYPE_signature_algorithms) {
++      CBS sigalgs;
++      if (!CBS_get_u16_length_prefixed(&extension_body, &sigalgs)) {
++        continue;
++      }
++      while (CBS_len(&sigalgs) >= 2) {
++        uint16_t sigalg_id;
++        if (!CBS_get_u16(&sigalgs, &sigalg_id)) {
++          break;
++        }
++        ssl_ja4_note_signature_algorithm(hs, sigalg_id);
++      }
++    } else if (extension_type == TLSEXT_TYPE_supported_versions) {
++      CBS versions;
++      if (!CBS_get_u8_length_prefixed(&extension_body, &versions)) {
++        continue;
++      }
++      while (CBS_len(&versions) >= 2) {
++        uint16_t version;
++        if (!CBS_get_u16(&versions, &version)) {
++          break;
++        }
++        ssl_ja4_note_supported_version(hs, version);
++      }
++    } else if (extension_type == TLSEXT_TYPE_supported_groups) {
++      CBS groups;
++      if (!CBS_get_u16_length_prefixed(&extension_body, &groups)) {
++        continue;
++      }
++      while (CBS_len(&groups) >= 2) {
++        uint16_t group_id;
++        if (!CBS_get_u16(&groups, &group_id)) {
++          break;
++        }
++        ssl_ja4_note_supported_group(hs, group_id);
++      }
++    } else if (extension_type == TLSEXT_TYPE_key_share) {
++      CBS entries;
++      if (!CBS_get_u16_length_prefixed(&extension_body, &entries)) {
++        continue;
++      }
++      while (CBS_len(&entries) > 0) {
++        uint16_t group_id;
++        CBS key;
++        if (!CBS_get_u16(&entries, &group_id) ||
++            !CBS_get_u16_length_prefixed(&entries, &key)) {
++          break;
++        }
++        ssl_ja4_note_keyshare_group(hs, group_id);
++      }
++    } else if (extension_type == TLSEXT_TYPE_psk_key_exchange_modes) {
++      CBS modes;
++      if (!CBS_get_u8_length_prefixed(&extension_body, &modes)) {
++        continue;
++      }
++      while (CBS_len(&modes) > 0) {
++        uint8_t mode;
++        if (!CBS_get_u8(&modes, &mode)) {
++          break;
++        }
++        ssl_ja4_note_psk_mode(hs, mode);
++      }
++    } else if (extension_type ==
++               TLSEXT_TYPE_application_layer_protocol_negotiation) {
++      CBS protocol_list;
++      if (!CBS_get_u16_length_prefixed(&extension_body, &protocol_list)) {
++        continue;
++      }
++      // Capture the raw wire bytes (length-prefixed token list) so the
++      // diagnostic compare can match the same encoding that requested_alpn
++      // uses.
++      Array<uint8_t> alpn_copy;
++      if (alpn_copy.CopyFrom(
++              Span(CBS_data(&protocol_list), CBS_len(&protocol_list)))) {
++        hs->ja4.final_alpn_wire = std::move(alpn_copy);
++      }
++    }
++  }
++
++  if (!hs->ja4.active) {
++    return;
++  }
++
++  // Drift detection: compare requested_* vs final_* lists.  No apply-path
++  // change here -- the wire bytes have already been emitted; we only update
++  // the diagnostic mask so strict mode can hard-fail downstream and the dump
++  // reflects what actually went on the wire.
++  if (!hs->ja4.cipher_suites.empty() &&
++      !ja4_arrays_equal_u16_modulo_grease(hs->ja4.cipher_suites,
++                                          hs->ja4.final_cipher_suites)) {
++    hs->ja4.mismatch_mask |= ssl_ja4_mismatch_cipher_suites;
++    hs->ja4.apply_ok = false;
++  }
++  if (!hs->ja4.alpn_wire.empty() &&
++      !ja4_arrays_equal_u8(hs->ja4.alpn_wire, hs->ja4.final_alpn_wire)) {
++    hs->ja4.mismatch_mask |= ssl_ja4_mismatch_alpn;
++    hs->ja4.apply_ok = false;
++  }
++  if (!hs->ja4.signature_algorithms.empty() &&
++      !ja4_arrays_equal_u16_modulo_grease(
++          hs->ja4.signature_algorithms,
++          hs->ja4.final_signature_algorithms)) {
++    hs->ja4.mismatch_mask |= ssl_ja4_mismatch_signature_algorithms;
++    hs->ja4.apply_ok = false;
++  }
++  if (!hs->ja4.extension_order.empty() &&
++      !ja4_extension_lists_equal_modulo_psk(hs->ja4.extension_order,
++                                            hs->ja4.final_extensions)) {
++    hs->ja4.mismatch_mask |= ssl_ja4_mismatch_extension_order;
++    hs->ja4.apply_ok = false;
++  }
++  if (!hs->ja4.supported_groups.empty() &&
++      !ja4_arrays_equal_u16_modulo_grease(hs->ja4.supported_groups,
++                                          hs->ja4.final_supported_groups)) {
++    hs->ja4.mismatch_mask |= ssl_ja4_mismatch_supported_groups;
++    hs->ja4.apply_ok = false;
++  }
++  // The psk_key_exchange_modes value only rides extension 45. If 45 isn't in
++  // extension_order, the configured modes value is dead data — comparing it
++  // against an empty final array would be a false positive.
++  const bool psk_modes_ext_emitted = ja4_array_contains_u16(
++      hs->ja4.extension_order, TLSEXT_TYPE_psk_key_exchange_modes);
++  if (psk_modes_ext_emitted && !hs->ja4.psk_key_exchange_modes.empty() &&
++      !ja4_arrays_equal_u8(hs->ja4.psk_key_exchange_modes,
++                           hs->ja4.final_psk_key_exchange_modes)) {
++    hs->ja4.mismatch_mask |= ssl_ja4_mismatch_psk_key_exchange_modes;
++    hs->ja4.apply_ok = false;
++  }
++}
++
++static void ssl_ja4_write_csv_u16(FILE *file, const char *key,
++                                  Span<const uint16_t> values) {
++  fprintf(file, "%s=", key);
++  for (size_t i = 0; i < values.size(); i++) {
++    if (i != 0) {
++      fputc(',', file);
++    }
++    fprintf(file, "%u", static_cast<unsigned>(values[i]));
++  }
++  fputc('\n', file);
++}
++
++static void ssl_ja4_write_csv_u8(FILE *file, const char *key,
++                                 Span<const uint8_t> values) {
++  fprintf(file, "%s=", key);
++  for (size_t i = 0; i < values.size(); i++) {
++    if (i != 0) {
++      fputc(',', file);
++    }
++    fprintf(file, "%u", static_cast<unsigned>(values[i]));
++  }
++  fputc('\n', file);
++}
++
++static void ssl_ja4_write_csv_alpn(FILE *file, const char *key,
++                                   Span<const uint8_t> values) {
++  fprintf(file, "%s=", key);
++  size_t offset = 0;
++  bool first = true;
++  while (offset < values.size()) {
++    const size_t token_len = values[offset++];
++    if (offset + token_len > values.size()) {
++      break;
++    }
++    if (!first) {
++      fputc(',', file);
++    }
++    fwrite(values.data() + offset, 1, token_len, file);
++    offset += token_len;
++    first = false;
++  }
++  fputc('\n', file);
++}
++
++static const char *ssl_ja4_sni_mode_str(ssl_ja4_sni_mode_t mode) {
++  switch (mode) {
++    case ssl_ja4_sni_present:
++      return "present";
++    case ssl_ja4_sni_domain:
++      return "domain";
++    case ssl_ja4_sni_none:
++      return "none";
++    case ssl_ja4_sni_ip:
++      return "ip";
++    case ssl_ja4_sni_unset:
++      break;
++  }
++  return "unset";
++}
++
++void ssl_ja4_write_dump(SSL_HANDSHAKE *hs) {
++  const char *dump_path = getenv("BORINGSSL_JA4_DUMP");
++  if (dump_path == nullptr || *dump_path == '\0') {
++    return;
++  }
++
++  FILE *file = fopen(dump_path, "w");
++  if (file == nullptr) {
++    return;
++  }
++
++  fprintf(file, "# generated by boringssl ja4 runtime\n");
++  fprintf(file, "active=%d\n", hs->ja4.active ? 1 : 0);
++  fprintf(file, "apply_ok=%d\n", hs->ja4.apply_ok ? 1 : 0);
++  fprintf(file, "mismatch_mask=%u\n", hs->ja4.mismatch_mask);
++  fprintf(file, "effective_tls_min=%u\n", hs->min_version);
++  fprintf(file, "effective_tls_max=%u\n", hs->max_version);
++  fprintf(file, "strict=%d\n", hs->ja4.strict_enabled ? 1 : 0);
++  fprintf(file, "sni_mode=%s\n", ssl_ja4_sni_mode_str(hs->ja4.sni_mode));
++  fprintf(file, "enable_grease=%d\n", ssl_ja4_should_enable_grease(hs) ? 1 : 0);
++  fprintf(file, "enable_ch_xtn_permutation=%d\n",
++          hs->config->permute_extensions ? 1 : 0);
++  if (hs->ja4.grease_value_set && ssl_ja4_should_enable_grease(hs)) {
++    fprintf(file, "grease_value=%u\n", hs->ja4.grease_value);
++  } else {
++    fprintf(file, "grease_value=\n");
++  }
++
++  // requested_* block (Eingabe-Override aus BORINGSSL_JA4_CONFIG).  Schema
++  // order is fixed by docs/ja4-diagnostic-schema.md and must stay in sync
++  // across libraries.
++  ssl_ja4_write_csv_u16(file, "requested_cipher_suites", hs->ja4.cipher_suites);
++  ssl_ja4_write_csv_alpn(file, "requested_alpn", hs->ja4.alpn_wire);
++  ssl_ja4_write_csv_u16(file, "requested_signature_algorithms",
++                        hs->ja4.signature_algorithms);
++  ssl_ja4_write_csv_u16(file, "requested_extension_order",
++                        hs->ja4.extension_order);
++  ssl_ja4_write_csv_u16(file, "requested_supported_versions",
++                        hs->ja4.supported_versions);
++  ssl_ja4_write_csv_u16(file, "requested_supported_groups",
++                        hs->ja4.supported_groups);
++  ssl_ja4_write_csv_u16(file, "requested_key_share_groups",
++                        hs->ja4.key_share_groups);
++  ssl_ja4_write_csv_u8(file, "requested_psk_key_exchange_modes",
++                       hs->ja4.psk_key_exchange_modes);
++
++  // final_* block (re-parsed aus serialisiertem ClientHello).
++  ssl_ja4_write_csv_u16(file, "final_cipher_suites",
++                        hs->ja4.final_cipher_suites);
++  ssl_ja4_write_csv_alpn(file, "final_alpn", hs->ja4.final_alpn_wire);
++  ssl_ja4_write_csv_u16(file, "final_signature_algorithms",
++                        hs->ja4.final_signature_algorithms);
++  ssl_ja4_write_csv_u16(file, "final_extension_order",
++                        hs->ja4.final_extensions);
++  ssl_ja4_write_csv_u16(file, "final_supported_versions",
++                        hs->ja4.final_supported_versions);
++  ssl_ja4_write_csv_u16(file, "final_supported_groups",
++                        hs->ja4.final_supported_groups);
++  ssl_ja4_write_csv_u16(file, "final_key_share_groups",
++                        hs->ja4.final_key_share_groups);
++  ssl_ja4_write_csv_u8(file, "final_psk_key_exchange_modes",
++                       hs->ja4.final_psk_key_exchange_modes);
++
++  // lib_boringssl_* block: BoringSSL-specific extras outside the JA4 schema.
++  {
++    const uint8_t seed = hs->grease_seed[0];
++    const uint16_t grease_cipher =
++        static_cast<uint16_t>(((seed & 0xf0u) | 0x0au) * 0x101u);
++    fprintf(file, "lib_boringssl_effective_grease_cipher=0x%04x\n",
++            static_cast<unsigned>(grease_cipher));
++  }
++  if (hs->ja4.tls_min_set) {
++    fprintf(file, "lib_boringssl_requested_tls_min=%u\n", hs->ja4.tls_min);
++  }
++  if (hs->ja4.tls_max_set) {
++    fprintf(file, "lib_boringssl_requested_tls_max=%u\n", hs->ja4.tls_max);
++  }
++
++  fclose(file);
++}
++
+ // Per http://tools.ietf.org/html/rfc5246#section-7.4.1.4, there may not be
+ // more than one extension of the same type in a ClientHello or ServerHello.
+ // This function does an initial scan over the extensions block to filter those
+@@ -1015,8 +2280,23 @@ static bool ext_sigalgs_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+   if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_signature_algorithms) ||
+       !CBB_add_u16_length_prefixed(out_compressible, &contents) ||
+       !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb) ||
+-      !tls12_add_verify_sigalgs(hs, &sigalgs_cbb) ||
+-      !CBB_flush(out_compressible)) {
++      !tls12_add_verify_sigalgs(hs, &sigalgs_cbb)) {
++    return false;
++  }
++
++  // Append a trailing GREASE sigalg to mirror the OpenSSL/NSS wire layout.
++  // The JA4 third hash includes sigalgs literally (no GREASE strip on this
++  // list), so cross-lib parity requires the same GREASE marker at the tail.
++  // Reuse the |ssl_grease_extension1| seed slot since BoringSSL has no
++  // dedicated sigalg-GREASE index; with a fixture-pinned grease_value, both
++  // libs converge on the same 0x?A?A constant.
++  if (ssl_ja4_should_enable_grease(hs) &&
++      !CBB_add_u16(&sigalgs_cbb,
++                   ssl_get_grease_value(hs, ssl_grease_extension1))) {
++    return false;
++  }
++
++  if (!CBB_flush(out_compressible)) {
+     return false;
+   }
+ 
+@@ -2072,8 +3352,17 @@ static bool ext_psk_key_exchange_modes_add_clienthello(
+   CBB contents, ke_modes;
+   if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_psk_key_exchange_modes) ||
+       !CBB_add_u16_length_prefixed(out_compressible, &contents) ||
+-      !CBB_add_u8_length_prefixed(&contents, &ke_modes) ||
+-      !CBB_add_u8(&ke_modes, SSL_PSK_DHE_KE)) {
++      !CBB_add_u8_length_prefixed(&contents, &ke_modes)) {
++    return false;
++  }
++
++  if (!hs->ja4.psk_key_exchange_modes.empty()) {
++    for (uint8_t mode : hs->ja4.psk_key_exchange_modes) {
++      if (!CBB_add_u8(&ke_modes, mode)) {
++        return false;
++      }
++    }
++  } else if (!CBB_add_u8(&ke_modes, SSL_PSK_DHE_KE)) {
+     return false;
+   }
+ 
+@@ -2286,7 +3575,7 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+     return false;
+   }
+ 
+-  if (override_group_id == 0 && ssl->ctx->grease_enabled) {
++  if (override_group_id == 0 && ssl_ja4_should_enable_grease(hs)) {
+     // Add a fake group. See RFC 8701.
+     if (!CBB_add_u16(cbb.get(), ssl_get_grease_value(hs, ssl_grease_group)) ||
+         !CBB_add_u16(cbb.get(), 1 /* length */) ||
+@@ -2474,7 +3763,6 @@ bool ssl_ext_key_share_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+ static bool ext_supported_versions_add_clienthello(
+     const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
+     ssl_client_hello_type_t type) {
+-  const SSL *const ssl = hs->ssl;
+   if (hs->max_version <= TLS1_2_VERSION) {
+     return true;
+   }
+@@ -2493,7 +3781,7 @@ static bool ext_supported_versions_add_clienthello(
+   }
+ 
+   // Add a fake version. See RFC 8701.
+-  if (ssl->ctx->grease_enabled &&
++  if (ssl_ja4_should_enable_grease(hs) &&
+       !CBB_add_u16(&versions, ssl_get_grease_value(hs, ssl_grease_version))) {
+     return false;
+   }
+@@ -2543,7 +3831,6 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
+                                                  CBB *out,
+                                                  CBB *out_compressible,
+                                                  ssl_client_hello_type_t type) {
+-  const SSL *const ssl = hs->ssl;
+   // In PAKE mode, supported_groups and key_share are not used.
+   if (hs->pake_prover != nullptr) {
+     return true;
+@@ -2557,7 +3844,7 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
+   }
+ 
+   // Add a fake group. See RFC 8701.
+-  if (ssl->ctx->grease_enabled &&
++  if (ssl_ja4_should_enable_grease(hs) &&
+       !CBB_add_u16(&groups_bytes, ssl_get_grease_value(hs, ssl_grease_group))) {
+     return false;
+   }
+@@ -3761,6 +5048,48 @@ static_assert(kNumExtensions <=
+               "too many extensions for received bitset");
+ 
+ bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
++  if (hs->ja4.active && hs->ja4.extension_mode != ssl_ja4_mode_none &&
++      !hs->ja4.extension_order.empty()) {
++    Array<uint8_t> permutation;
++    if (!permutation.InitForOverwrite(kNumExtensions)) {
++      return false;
++    }
++
++    bool used[kNumExtensions] = {false};
++    size_t out = 0;
++    for (uint16_t ext_type : hs->ja4.extension_order) {
++      if (ext_type == TLSEXT_TYPE_pre_shared_key) {
++        // pre_shared_key is serialized separately and must be last.
++        continue;
++      }
++      bool found = false;
++      for (size_t i = 0; i < kNumExtensions; i++) {
++        if (kExtensions[i].value != ext_type || used[i]) {
++          continue;
++        }
++        permutation[out++] = static_cast<uint8_t>(i);
++        used[i] = true;
++        found = true;
++        break;
++      }
++      // The ID has no native BoringSSL builder. That is fine: synthetic-emit
++      // (ssl_ja4_emit_synthetic_extensions) covers any unknown ext_type with
++      // at minimum a generic empty-body stub, and the post-emit reorder
++      // (ssl_ja4_reorder_emitted_extensions) places it in the right slot.
++      // Don't taint the apply mask or fail strict mode just because the
++      // permutation table can't map it.
++      (void)found;
++    }
++
++    for (size_t i = 0; i < kNumExtensions; i++) {
++      if (!used[i]) {
++        permutation[out++] = static_cast<uint8_t>(i);
++      }
++    }
++    hs->extension_permutation = std::move(permutation);
++    return true;
++  }
++
+   if (!hs->config->permute_extensions) {
+     return true;
+   }
+@@ -3797,6 +5126,449 @@ static const struct tls_extension *tls_extension_find(uint32_t *out_index,
+   return nullptr;
+ }
+ 
++static bool ssl_ja4_validate_requested_extensions_sent(SSL_HANDSHAKE *hs,
++                                                       uint32_t sent_mask,
++                                                       bool psk_sent) {
++  if (!(hs->ja4.active && hs->ja4.extension_mode == ssl_ja4_mode_exact) ||
++      hs->ja4.extension_order.empty()) {
++    return true;
++  }
++
++  static_assert(kNumExtensions <= sizeof(sent_mask) * 8, "too many bits");
++  for (uint16_t ext_type : hs->ja4.extension_order) {
++    if (ext_type == TLSEXT_TYPE_pre_shared_key) {
++      if (!psk_sent) {
++        hs->ja4.apply_ok = false;
++        hs->ja4.mismatch_mask |= ssl_ja4_mismatch_missing_extension;
++        if (hs->ja4.strict_enabled) {
++          return false;
++        }
++      }
++      continue;
++    }
++
++    if (ja4_array_contains_u16(hs->ja4.synthetic_sent, ext_type)) {
++      // Phase 2 parity: extension was emitted via the synthetic constructor.
++      continue;
++    }
++
++    uint32_t ext_index = 0;
++    const struct tls_extension *ext = tls_extension_find(&ext_index, ext_type);
++    if (ext == nullptr) {
++      hs->ja4.apply_ok = false;
++      hs->ja4.mismatch_mask |= ssl_ja4_mismatch_missing_extension;
++      if (hs->ja4.strict_enabled) {
++        return false;
++      }
++      continue;
++    }
++    (void)ext;
++
++    if ((sent_mask & (1u << ext_index)) == 0) {
++      hs->ja4.apply_ok = false;
++      hs->ja4.mismatch_mask |= ssl_ja4_mismatch_missing_extension;
++      if (hs->ja4.strict_enabled) {
++        return false;
++      }
++    }
++  }
++
++  return true;
++}
++
++// Phase 2 parity helpers: force-emit and synthetic-extension constructor.
++//
++// JA4-config-driven ClientHello replay sometimes requires emitting extensions
++// that BoringSSL's native builders normally suppress (for example
++// |status_request| when no OCSP responder is configured) and extensions for
++// which BoringSSL has no native builder at all (for example
++// |record_size_limit| 0x001c). These helpers gate strictly on the JA4 config:
++// force-emit only triggers when the extension is explicitly listed in
++// |extension_order| and |extension_mode| is one of {exact, reorder}.
++static bool ssl_ja4_force_emit_enabled(const SSL_HANDSHAKE *hs,
++                                       uint16_t ext_type) {
++  if (!hs->ja4.active) {
++    return false;
++  }
++  if (hs->ja4.extension_mode != ssl_ja4_mode_exact &&
++      hs->ja4.extension_mode != ssl_ja4_mode_reorder) {
++    return false;
++  }
++  if (hs->ja4.extension_order.empty()) {
++    return false;
++  }
++  return ja4_array_contains_u16(hs->ja4.extension_order, ext_type);
++}
++
++// ssl_ja4_force_emit_native_if_needed writes a forced minimal payload for
++// |ext_type| if the native builder produced no bytes but JA4 config requested
++// emission. Returns true on success (whether or not anything was written).
++// |out_emitted| is set to true when this helper wrote a stub.
++static bool ssl_ja4_force_emit_native_if_needed(const SSL_HANDSHAKE *hs,
++                                                CBB *out, uint16_t ext_type,
++                                                bool *out_emitted) {
++  *out_emitted = false;
++  if (!ssl_ja4_force_emit_enabled(hs, ext_type)) {
++    return true;
++  }
++
++  CBB child;
++  switch (ext_type) {
++    case TLSEXT_TYPE_status_request: {
++      // status_request body: status_type=ocsp(1), responder_id_list=empty,
++      // extensions=empty. RFC 6066 / RFC 8446 4.4.2.1.
++      static const uint8_t kBody[] = {0x01, 0x00, 0x00, 0x00, 0x00};
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||
++          !CBB_add_bytes(&child, kBody, sizeof(kBody)) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case TLSEXT_TYPE_certificate_timestamp: {
++      // signed_certificate_timestamp body: empty per RFC 6962 4.3.
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case TLSEXT_TYPE_session_ticket: {
++      // SessionTicket body: empty (announce support, no ticket). RFC 5077.
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case 0x0016: {  // encrypt_then_mac (no native BoringSSL builder).
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case TLSEXT_TYPE_padding: {
++      // padding extension stub: 1 byte. The F5-padding logic later in
++      // |ssl_add_clienthello_tlsext| may add an additional padding extension;
++      // this stub is only emitted if explicitly requested up-front.
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||
++          !CBB_add_u8(&child, 0x00) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case 0x0031: {  // post_handshake_auth (RFC 8446 4.2.6, no body).
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case TLSEXT_TYPE_delegated_credential: {
++      // delegated_credential body: empty SignatureSchemeList. RFC 9345 4.
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||
++          !CBB_add_u16(&child, 0) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case TLSEXT_TYPE_application_settings:
++    case TLSEXT_TYPE_application_settings_old: {
++      // ALPS (draft-vvv-tls-alps) body: u16-prefixed list of ALPN protocol names
++      // we are willing to negotiate ALPS for. Use {h2} as the conservative
++      // default — matches Chrome's stable wire shape when no ALPS settings are
++      // configured. Both the new (17613) and legacy (17513) code points share
++      // the same body layout.
++      CBB protos, proto;
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||
++          !CBB_add_u16_length_prefixed(&child, &protos) ||
++          !CBB_add_u8_length_prefixed(&protos, &proto) ||
++          !CBB_add_bytes(&proto, reinterpret_cast<const uint8_t *>("h2"), 2) ||
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case TLSEXT_TYPE_cert_compression: {
++      // compress_certificate body: u8-prefixed list of u16 algorithms.
++      // Stub: brotli(2) only — matches the Chrome ClientHello wire shape when
++      // no cert-compression algos are negotiated by the application.
++      CBB algs;
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||
++          !CBB_add_u8_length_prefixed(&child, &algs) ||
++          !CBB_add_u16(&algs, 2) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    case TLSEXT_TYPE_encrypted_client_hello: {
++      // ECH GREASE-mode stub: ECHClientHello with type=outer(0), a placeholder
++      // HpkeKdfId/HpkeAeadId pair, empty config_id, empty enc, empty payload.
++      // Body shape per draft-ietf-tls-esni-18 5.1; the server treats unknown
++      // configs as GREASE so the wire-position is what matters here, not the
++      // crypto. Layout: type(u8=0) | kdf(u16=0x0001) | aead(u16=0x0001) |
++      // config_id(u8=0) | enc(u16len=0) | payload(u16len=0).
++      CBB enc_field, payload_field;
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||
++          !CBB_add_u8(&child, 0) ||
++          !CBB_add_u16(&child, 0x0001) ||
++          !CBB_add_u16(&child, 0x0001) ||
++          !CBB_add_u8(&child, 0) ||
++          !CBB_add_u16_length_prefixed(&child, &enc_field) ||
++          !CBB_add_u16_length_prefixed(&child, &payload_field) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++    default: {
++      // EXACT mode + native builder produced 0 bytes (e.g. trust_anchors
++      // 0xca34 without requested_trust_anchors set, channel_id without
++      // a configured key, etc.). Emit a generic empty-body stub so the
++      // user's explicit extension_order survives on the wire. Mirrors the
++      // ja4_emit_synthetic_extension default branch.
++      CBB stub_child;
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &stub_child) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      *out_emitted = true;
++      return true;
++    }
++  }
++}
++
++// ja4_emit_synthetic_extension writes a minimal stub for an extension that
++// has no native BoringSSL builder. Mirrors the OpenSSL Phase 2
++// |ja4_construct_synthetic_extension| helper.
++static bool ja4_emit_synthetic_extension(CBB *out, uint16_t ext_type) {
++  CBB child;
++  switch (ext_type) {
++    case 0x001c: {  // record_size_limit -> body=0x4001 (16385), big-endian.
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||
++          !CBB_add_u16(&child, 0x4001) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      return true;
++    }
++    case 0x001b: {  // compress_certificate.
++      // Body per RFC 8879: u8 list-length, then list of u16 algorithms.
++      // Schema fixture: 0x0002 (zstd), 0x0001 (zlib), 0x0002 (zstd) — the
++      // duplicate is intentional for parity with the OpenSSL synthetic stub.
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||
++          !CBB_add_u8(&child, 0x06) ||
++          !CBB_add_u16(&child, 0x0002) ||
++          !CBB_add_u16(&child, 0x0001) ||
++          !CBB_add_u16(&child, 0x0002) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      return true;
++    }
++    case 0x0022: {  // delegated_credentials -> empty body (sigschemes stub).
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      return true;
++    }
++    default: {
++      // Generic stub: empty body.
++      if (!CBB_add_u16(out, ext_type) ||
++          !CBB_add_u16_length_prefixed(out, &child) ||  //
++          !CBB_flush(out)) {
++        return false;
++      }
++      return true;
++    }
++  }
++}
++
++// ssl_ja4_emit_synthetic_extensions appends, in |extension_order| order, all
++// extensions that have no native BoringSSL builder. Must be called after the
++// native-builder loop and before PSK-last normalization. Records the emitted
++// types in |hs->ja4.synthetic_sent| so that
++// |ssl_ja4_validate_requested_extensions_sent| does not flag them as missing.
++static bool ssl_ja4_emit_synthetic_extensions(SSL_HANDSHAKE *hs, CBB *out) {
++  if (!hs->ja4.active) {
++    return true;
++  }
++  if (hs->ja4.extension_mode != ssl_ja4_mode_exact &&
++      hs->ja4.extension_mode != ssl_ja4_mode_reorder) {
++    return true;
++  }
++  if (hs->ja4.extension_order.empty()) {
++    return true;
++  }
++
++  for (uint16_t ext_type : hs->ja4.extension_order) {
++    if (ext_type == TLSEXT_TYPE_pre_shared_key) {
++      continue;  // pre_shared_key is emitted separately, last.
++    }
++    uint32_t ext_index = 0;
++    if (tls_extension_find(&ext_index, ext_type) != nullptr) {
++      continue;  // Has a native builder; handled in the main loop.
++    }
++    if (ja4_array_contains_u16(hs->ja4.synthetic_sent, ext_type)) {
++      continue;
++    }
++    if (!ja4_emit_synthetic_extension(out, ext_type)) {
++      return false;
++    }
++    if (!ja4_append_u16(&hs->ja4.synthetic_sent, ext_type)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// ssl_ja4_reorder_emitted_extensions re-parses the extensions buffer produced
++// by the native + synthetic emission pass and rewrites it in
++// |hs->ja4.extension_order| order. PSK is added separately (always last) and
++// is not part of the buffer at this point. GREASE1 (the leading empty fake
++// extension) is preserved at the front; any extension whose type is not in
++// |extension_order| is appended after the ordered block (this catches GREASE
++// and other future additions). No-op when JA4 is inactive or no
++// extension_order is configured.
++static bool ssl_ja4_reorder_emitted_extensions(SSL_HANDSHAKE *hs,
++                                               CBB *extensions) {
++  if (!hs->ja4.active || hs->ja4.extension_order.empty()) {
++    return true;
++  }
++  if (hs->ja4.extension_mode != ssl_ja4_mode_exact &&
++      hs->ja4.extension_mode != ssl_ja4_mode_reorder) {
++    return true;
++  }
++
++  if (!CBB_flush(extensions)) {
++    return false;
++  }
++
++  const uint8_t *data = CBB_data(extensions);
++  size_t data_len = CBB_len(extensions);
++
++  struct ParsedExt {
++    uint16_t type;
++    const uint8_t *bytes;  // points into |data|
++    size_t total_len;      // header (4 bytes) + body
++  };
++  std::vector<ParsedExt> parsed;
++  CBS cbs;
++  CBS_init(&cbs, data, data_len);
++  while (CBS_len(&cbs) > 0) {
++    const uint8_t *start = CBS_data(&cbs);
++    uint16_t t;
++    CBS body;
++    if (!CBS_get_u16(&cbs, &t) || !CBS_get_u16_length_prefixed(&cbs, &body)) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
++    }
++    const uint8_t *end = CBS_data(&cbs);
++    parsed.push_back({t, start, static_cast<size_t>(end - start)});
++  }
++
++  // GREASE1 (added before the native loop) and GREASE2 (added after synthetic)
++  // both look like padding-style extensions whose types are valid GREASE values
++  // (low byte == 0x0a). Detect by comparing against ssl_get_grease_value to
++  // avoid coupling to a specific value here.
++  uint16_t grease1 = ssl_ja4_should_enable_grease(hs)
++                         ? ssl_get_grease_value(hs, ssl_grease_extension1)
++                         : 0;
++
++  std::vector<bool> taken(parsed.size(), false);
++
++  // Build the rewritten buffer in a scratch CBB, then swap into |extensions|.
++  bssl::ScopedCBB scratch;
++  if (!CBB_init(scratch.get(), data_len)) {
++    return false;
++  }
++
++  // 1. GREASE1 stays at the front if present.
++  for (size_t i = 0; i < parsed.size(); i++) {
++    if (parsed[i].type == grease1 && grease1 != 0) {
++      if (!CBB_add_bytes(scratch.get(), parsed[i].bytes, parsed[i].total_len)) {
++        return false;
++      }
++      taken[i] = true;
++      break;
++    }
++  }
++
++  // 2. Walk extension_order; for each non-PSK type, append the first parsed
++  // entry of that type that hasn't been taken yet.
++  for (uint16_t want : hs->ja4.extension_order) {
++    if (want == TLSEXT_TYPE_pre_shared_key) {
++      continue;  // PSK is added separately, last.
++    }
++    for (size_t i = 0; i < parsed.size(); i++) {
++      if (!taken[i] && parsed[i].type == want) {
++        if (!CBB_add_bytes(scratch.get(), parsed[i].bytes,
++                           parsed[i].total_len)) {
++          return false;
++        }
++        taken[i] = true;
++        break;
++      }
++    }
++  }
++
++  // 3. Anything not yet taken (GREASE2, future additions) appended in original
++  // order.
++  for (size_t i = 0; i < parsed.size(); i++) {
++    if (!taken[i]) {
++      if (!CBB_add_bytes(scratch.get(), parsed[i].bytes, parsed[i].total_len)) {
++        return false;
++      }
++      taken[i] = true;
++    }
++  }
++
++  if (!CBB_flush(scratch.get())) {
++    return false;
++  }
++
++  // Replace |extensions| contents in-place. CBB has no truncate API, so we
++  // discard the existing contents and re-add the rewritten bytes.
++  size_t new_len = CBB_len(scratch.get());
++  if (new_len != data_len) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  // Same total length, so we can overwrite in place via memcpy on the backing
++  // buffer (CBB exposes a pointer and we have a length-equality precondition).
++  OPENSSL_memcpy(const_cast<uint8_t *>(data), CBB_data(scratch.get()), new_len);
++  return true;
++}
++
+ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
+   CBB child;
+   if (!CBB_add_u16(cbb, ext) ||  //
+@@ -3816,7 +5588,6 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+   // are written to |extensions| and copied to |extensions_encoded|. Compressed
+   // extensions are buffered in |compressed| and written to the end. (ECH can
+   // only compress contiguous extensions.)
+-  SSL *const ssl = hs->ssl;
+   bssl::ScopedCBB compressed, outer_extensions;
+   CBB extensions, extensions_encoded;
+   if (!CBB_add_u16_length_prefixed(out, &extensions) ||
+@@ -3828,8 +5599,9 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+   }
+ 
+   hs->inner_extensions_sent = 0;
++  hs->ja4.synthetic_sent.Reset();
+ 
+-  if (ssl->ctx->grease_enabled) {
++  if (ssl_ja4_should_emit_standalone_grease_extensions(hs)) {
+     // Add a fake empty extension. See RFC 8701. This always matches
+     // |ssl_add_clienthello_tlsext|, so compress it.
+     uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension1);
+@@ -3843,6 +5615,10 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+     size_t i = hs->extension_permutation.empty()
+                    ? unpermuted
+                    : hs->extension_permutation[unpermuted];
++    if (hs->ja4.active && hs->ja4.extension_mode == ssl_ja4_mode_exact &&
++        !ssl_ja4_is_extension_requested_exact(hs, kExtensions[i].value)) {
++      continue;
++    }
+     const size_t len_before = CBB_len(&extensions);
+     const size_t len_compressed_before = CBB_len(compressed.get());
+     if (!kExtensions[i].add_clienthello(hs, &extensions, compressed.get(),
+@@ -3852,11 +5628,25 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+       return false;
+     }
+ 
+-    const size_t bytes_written = CBB_len(&extensions) - len_before;
++    size_t bytes_written = CBB_len(&extensions) - len_before;
+     const size_t bytes_written_compressed =
+         CBB_len(compressed.get()) - len_compressed_before;
+     // The callback may write to at most one output.
+     assert(bytes_written == 0 || bytes_written_compressed == 0);
++
++    // Phase 2 parity: if the native builder suppressed an extension that JA4
++    // config requires, emit the standard payload as a forced stub.
++    if (bytes_written == 0 && bytes_written_compressed == 0) {
++      bool forced = false;
++      if (!ssl_ja4_force_emit_native_if_needed(hs, &extensions,
++                                               kExtensions[i].value, &forced)) {
++        return false;
++      }
++      if (forced) {
++        bytes_written = CBB_len(&extensions) - len_before;
++      }
++    }
++
+     if (bytes_written != 0 || bytes_written_compressed != 0) {
+       hs->inner_extensions_sent |= (1u << i);
+     }
+@@ -3867,7 +5657,21 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+     }
+   }
+ 
+-  if (ssl->ctx->grease_enabled) {
++  // Phase 2 parity: emit synthetic extensions (no native BoringSSL builder)
++  // before GREASE2 / PSK so |extension_order| is honored.
++  if (!ssl_ja4_emit_synthetic_extensions(hs, &extensions)) {
++    return false;
++  }
++
++  // Phase 2 parity: rewrite the emitted extensions in |extension_order| order.
++  // The native loop iterates |kExtensions| (modulo permutation) and synthetic
++  // emit appends at the end; this pass interleaves both so the final wire
++  // honors the JA4 config exactly.
++  if (!ssl_ja4_reorder_emitted_extensions(hs, &extensions)) {
++    return false;
++  }
++
++  if (ssl_ja4_should_emit_standalone_grease_extensions(hs)) {
+     // Add a fake non-empty extension. See RFC 8701. This always matches
+     // |ssl_add_clienthello_tlsext|, so compress it.
+     uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension2);
+@@ -3903,13 +5707,30 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+   // The PSK extension must be last. It is never compressed. Note, if there is a
+   // binder, the caller will need to update both ClientHelloInner and
+   // EncodedClientHelloInner after computing it.
+-  const size_t len_before = CBB_len(&extensions);
+-  if (!ext_pre_shared_key_add_clienthello(hs, &extensions, out_needs_psk_binder,
+-                                          ssl_client_hello_inner) ||
+-      !CBB_add_bytes(&extensions_encoded, CBB_data(&extensions) + len_before,
+-                     CBB_len(&extensions) - len_before) ||
+-      !CBB_flush(out) ||  //
+-      !CBB_flush(out_encoded)) {
++  const bool include_psk_extension =
++      hs->ja4.extension_mode != ssl_ja4_mode_exact ||
++      hs->ja4.extension_order.empty() ||
++      ssl_ja4_is_extension_requested_exact(hs, TLSEXT_TYPE_pre_shared_key);
++  bool psk_sent = false;
++  if (include_psk_extension) {
++    const size_t len_before_psk = CBB_len(&extensions);
++    if (!ext_pre_shared_key_add_clienthello(hs, &extensions,
++                                            out_needs_psk_binder,
++                                            ssl_client_hello_inner)) {
++      return false;
++    }
++    psk_sent = CBB_len(&extensions) > len_before_psk;
++    if (!CBB_add_bytes(&extensions_encoded, CBB_data(&extensions) + len_before_psk,
++                       CBB_len(&extensions) - len_before_psk)) {
++      return false;
++    }
++  }
++
++  if (!CBB_flush(out) || !CBB_flush(out_encoded)) {
++    return false;
++  }
++  if (!ssl_ja4_validate_requested_extensions_sent(hs, hs->inner_extensions_sent,
++                                                  psk_sent)) {
+     return false;
+   }
+ 
+@@ -3939,9 +5760,10 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+   // 1.3 HelloRetryRequest. For the latter, the extensions may change, so it is
+   // important to reset this value.
+   hs->extensions.sent = 0;
++  hs->ja4.synthetic_sent.Reset();
+ 
+   // Add a fake empty extension. See RFC 8701.
+-  if (ssl->ctx->grease_enabled &&
++  if (ssl_ja4_should_emit_standalone_grease_extensions(hs) &&
+       !add_padding_extension(
+           &extensions, ssl_get_grease_value(hs, ssl_grease_extension1), 0)) {
+     return false;
+@@ -3952,6 +5774,10 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+     size_t i = hs->extension_permutation.empty()
+                    ? unpermuted
+                    : hs->extension_permutation[unpermuted];
++    if (hs->ja4.active && hs->ja4.extension_mode == ssl_ja4_mode_exact &&
++        !ssl_ja4_is_extension_requested_exact(hs, kExtensions[i].value)) {
++      continue;
++    }
+     const size_t len_before = CBB_len(&extensions);
+     if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
+       OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
+@@ -3959,7 +5785,21 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+       return false;
+     }
+ 
+-    const size_t bytes_written = CBB_len(&extensions) - len_before;
++    size_t bytes_written = CBB_len(&extensions) - len_before;
++
++    // Phase 2 parity: if the native builder suppressed an extension that JA4
++    // config requires, emit the standard payload as a forced stub.
++    if (bytes_written == 0) {
++      bool forced = false;
++      if (!ssl_ja4_force_emit_native_if_needed(hs, &extensions,
++                                               kExtensions[i].value, &forced)) {
++        return false;
++      }
++      if (forced) {
++        bytes_written = CBB_len(&extensions) - len_before;
++      }
++    }
++
+     if (bytes_written != 0) {
+       hs->extensions.sent |= (1u << i);
+     }
+@@ -3968,7 +5808,23 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+     last_was_empty = (bytes_written == 4);
+   }
+ 
+-  if (ssl->ctx->grease_enabled) {
++  // Phase 2 parity: emit synthetic extensions (no native BoringSSL builder)
++  // before GREASE2 / F5-padding / PSK so |extension_order| is honored.
++  if (!ssl_ja4_emit_synthetic_extensions(hs, &extensions)) {
++    return false;
++  }
++  if (!hs->ja4.synthetic_sent.empty()) {
++    last_was_empty = false;
++  }
++
++  // Phase 2 parity: rewrite the emitted extensions in |extension_order| order.
++  // Must run before GREASE2 / F5-padding / PSK so those wire-tail extensions
++  // stay at the wire tail.
++  if (!ssl_ja4_reorder_emitted_extensions(hs, &extensions)) {
++    return false;
++  }
++
++  if (ssl_ja4_should_emit_standalone_grease_extensions(hs)) {
+     // Add a fake non-empty extension. See RFC 8701.
+     if (!add_padding_extension(
+             &extensions, ssl_get_grease_value(hs, ssl_grease_extension2), 1)) {
+@@ -3980,9 +5836,22 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+   // In cleartext ClientHellos, we add the padding extension to work around
+   // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
+   // images aligned.
+-  size_t psk_extension_len = ext_pre_shared_key_clienthello_length(hs, type);
++  const bool include_psk_extension =
++      hs->ja4.extension_mode != ssl_ja4_mode_exact ||
++      hs->ja4.extension_order.empty() ||
++      ssl_ja4_is_extension_requested_exact(hs, TLSEXT_TYPE_pre_shared_key);
++  bool psk_sent = false;
++  size_t psk_extension_len =
++      include_psk_extension ? ext_pre_shared_key_clienthello_length(hs, type)
++                            : 0;
++  // JA4-exact mode: the user has already authored padding (or chosen not to)
++  // via |extension_order|; the F5-bug workaround would emit a second padding
++  // extension and drift the wire fingerprint, so skip the auto-padder.
++  const bool ja4_skip_auto_padding =
++      hs->ja4.active && hs->ja4.extension_mode == ssl_ja4_mode_exact &&
++      !hs->ja4.extension_order.empty();
+   if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
+-      !ssl->s3->used_hello_retry_request) {
++      !ssl->s3->used_hello_retry_request && !ja4_skip_auto_padding) {
+     header_len +=
+         SSL3_HM_HEADER_LENGTH + 2 + CBB_len(&extensions) + psk_extension_len;
+     size_t padding_len = 0;
+@@ -4025,14 +5894,22 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+   }
+ 
+   // The PSK extension must be last, including after the padding.
+-  const size_t len_before = CBB_len(&extensions);
+-  if (!ext_pre_shared_key_add_clienthello(hs, &extensions, out_needs_psk_binder,
+-                                          type)) {
+-    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++  if (include_psk_extension) {
++    const size_t len_before = CBB_len(&extensions);
++    if (!ext_pre_shared_key_add_clienthello(hs, &extensions,
++                                            out_needs_psk_binder, type)) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
++    }
++    psk_sent = CBB_len(&extensions) > len_before;
++    assert(psk_extension_len == CBB_len(&extensions) - len_before);
++    (void)len_before;  // |assert| is omitted in release builds.
++  }
++
++  if (!ssl_ja4_validate_requested_extensions_sent(hs, hs->extensions.sent,
++                                                  psk_sent)) {
+     return false;
+   }
+-  assert(psk_extension_len == CBB_len(&extensions) - len_before);
+-  (void)len_before;  // |assert| is omitted in release builds.
+ 
+   // Discard empty extensions blocks.
+   if (CBB_len(&extensions) == 0) {
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index c96dedc4d..414554cd0 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -22,6 +22,7 @@
+ 
+ #include <algorithm>
+ #include <utility>
++#include <vector>
+ 
+ #include <openssl/aead.h>
+ #include <openssl/bn.h>
+@@ -82,6 +83,11 @@ static void ssl_get_client_disabled(const SSL_HANDSHAKE *hs,
+   }
+ }
+ 
++static bool ja4_array_contains_u16(Span<const uint16_t> values,
++                                   uint16_t needle) {
++  return std::find(values.begin(), values.end(), needle) != values.end();
++}
++
+ static bool ssl_add_tls13_cipher(CBB *cbb, uint16_t cipher_id,
+                                  ssl_compliance_policy_t policy) {
+   if (ssl_tls13_cipher_meets_policy(cipher_id, policy)) {
+@@ -90,7 +96,7 @@ static bool ssl_add_tls13_cipher(CBB *cbb, uint16_t cipher_id,
+   return true;
+ }
+ 
+-static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
++static bool ssl_write_client_cipher_list(SSL_HANDSHAKE *hs, CBB *out,
+                                          ssl_client_hello_type_t type) {
+   const SSL *const ssl = hs->ssl;
+   uint32_t mask_a, mask_k;
+@@ -102,11 +108,35 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+   }
+ 
+   // Add a fake cipher suite. See RFC 8701.
+-  if (ssl->ctx->grease_enabled &&
++  const bool has_cipher_override = !hs->ja4.cipher_suites.empty();
++  const bool reorder_cipher_override =
++      has_cipher_override && hs->ja4.cipher_mode == ssl_ja4_mode_reorder;
++  const bool exact_cipher_override =
++      has_cipher_override && hs->ja4.cipher_mode != ssl_ja4_mode_reorder;
++
++  if (ssl_ja4_should_enable_grease(hs) &&
+       !CBB_add_u16(&child, ssl_get_grease_value(hs, ssl_grease_cipher))) {
+     return false;
+   }
+ 
++  if (has_cipher_override) {
++    for (uint16_t cipher_id : hs->ja4.cipher_suites) {
++      if (!CBB_add_u16(&child, cipher_id)) {
++        return false;
++      }
++    }
++    if (exact_cipher_override) {
++      if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV) {
++        if (!ja4_array_contains_u16(hs->ja4.cipher_suites,
++                                    SSL_CIPHER_FALLBACK_SCSV) &&
++            !CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
++          return false;
++        }
++      }
++      return CBB_flush(out);
++    }
++  }
++
+   // Add TLS 1.3 ciphers. Order ChaCha20-Poly1305 relative to AES-GCM based on
+   // hardware support.
+   if (hs->max_version >= TLS1_3_VERSION) {
+@@ -136,6 +166,10 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+                           : bssl::Span<const uint16_t>(kCiphersNoAESHardware));
+ 
+     for (auto cipher : ciphers) {
++      if (reorder_cipher_override &&
++          ja4_array_contains_u16(hs->ja4.cipher_suites, cipher)) {
++        continue;
++      }
+       if (!ssl_add_tls13_cipher(&child, cipher,
+                                 ssl->config->compliance_policy)) {
+         return false;
+@@ -155,8 +189,13 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+           SSL_CIPHER_get_max_version(cipher) < hs->min_version) {
+         continue;
+       }
++      const uint16_t cipher_id = SSL_CIPHER_get_protocol_id(cipher);
++      if (reorder_cipher_override &&
++          ja4_array_contains_u16(hs->ja4.cipher_suites, cipher_id)) {
++        continue;
++      }
+       any_enabled = true;
+-      if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++      if (!CBB_add_u16(&child, cipher_id)) {
+         return false;
+       }
+     }
+@@ -169,7 +208,10 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+   }
+ 
+   if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV) {
+-    if (!CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
++    if (!(has_cipher_override &&
++          ja4_array_contains_u16(hs->ja4.cipher_suites,
++                                 SSL_CIPHER_FALLBACK_SCSV)) &&
++        !CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
+       return false;
+     }
+   }
+@@ -177,7 +219,7 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+   return CBB_flush(out);
+ }
+ 
+-bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
++bool ssl_write_client_hello_without_extensions(SSL_HANDSHAKE *hs,
+                                                CBB *cbb,
+                                                ssl_client_hello_type_t type,
+                                                bool empty_session_id) {
+@@ -230,6 +272,9 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+       !ssl_add_clienthello_tlsext(hs, &body, /*out_encoded=*/nullptr,
+                                   &needs_psk_binder, type, CBB_len(&body)) ||
+       !ssl->method->finish_message(ssl, cbb.get(), &msg)) {
++    if (hs->ja4.active || hs->ja4.parsed_once) {
++      ssl_ja4_write_dump(hs);
++    }
+     return false;
+   }
+ 
+@@ -245,6 +290,16 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+     }
+   }
+ 
++  ssl_ja4_capture_client_hello(hs, Span(msg));
++  ssl_ja4_write_dump(hs);
++  // Strict-Vertrag (docs/ja4-diagnostic-schema.md): wenn unter strict=1 ein
++  // beliebiges Mismatch-Bit gesetzt wurde, fuehrt das zu einem harten
++  // Handshake-Abbruch.  Der Dump ist bereits geschrieben, damit die Diagnose
++  // weiterhin verfuegbar ist.
++  if (hs->ja4.strict_enabled && hs->ja4.mismatch_mask != 0) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
+   return ssl->method->add_message(ssl, std::move(msg));
+ }
+ 
+@@ -352,6 +407,13 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+     return ssl_hs_error;
+   }
+ 
++  if (!ssl_ja4_prepare_client_hello(hs)) {
++    // Emit an early dump even on strict preflight failure so launcher/UI can
++    // surface parse/apply issues without needing a successful handshake.
++    ssl_ja4_write_dump(hs);
++    return ssl_hs_error;
++  }
++
+   uint8_t ech_enc[EVP_HPKE_MAX_ENC_LENGTH];
+   size_t ech_enc_len;
+   if (!ssl_select_ech_config(hs, ech_enc, &ech_enc_len)) {
+diff --git a/ssl/internal.h b/ssl/internal.h
+index e0fe1bfed..e558fe6fd 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -1703,6 +1703,84 @@ struct SSLPAKEShare {
+   Array<uint8_t> pake_message;
+ };
+ 
++enum ssl_ja4_mode_t {
++  ssl_ja4_mode_none = 0,
++  ssl_ja4_mode_reorder,
++  ssl_ja4_mode_exact,
++};
++
++enum ssl_ja4_sni_mode_t {
++  ssl_ja4_sni_unset = 0,
++  ssl_ja4_sni_present,
++  ssl_ja4_sni_domain,
++  ssl_ja4_sni_none,
++  ssl_ja4_sni_ip,
++};
++
++enum ssl_ja4_mismatch_bits_t {
++  ssl_ja4_mismatch_parse = (1u << 0),
++  ssl_ja4_mismatch_apply = (1u << 1),
++  ssl_ja4_mismatch_key_shares = (1u << 2),
++  ssl_ja4_mismatch_supported_versions = (1u << 3),
++  ssl_ja4_mismatch_unknown_key = (1u << 4),
++  ssl_ja4_mismatch_invalid_config = (1u << 5),
++  ssl_ja4_mismatch_missing_extension = (1u << 6),
++  ssl_ja4_mismatch_cipher_suites = (1u << 7),
++  ssl_ja4_mismatch_alpn = (1u << 8),
++  ssl_ja4_mismatch_signature_algorithms = (1u << 9),
++  ssl_ja4_mismatch_extension_order = (1u << 10),
++  ssl_ja4_mismatch_supported_groups = (1u << 11),
++  ssl_ja4_mismatch_psk_key_exchange_modes = (1u << 12),
++};
++
++struct SSLJA4Config {
++  static constexpr bool kAllowUniquePtr = true;
++
++  bool active = false;
++  bool strict_set = false;
++  bool strict_enabled = false;
++  bool tls_min_set = false;
++  uint16_t tls_min = 0;
++  bool tls_max_set = false;
++  uint16_t tls_max = 0;
++
++  Array<uint16_t> cipher_suites;
++  enum ssl_ja4_mode_t cipher_mode = ssl_ja4_mode_none;
++  Array<uint8_t> alpn_wire;
++  Array<uint16_t> signature_algorithms;
++  Array<uint16_t> supported_versions;
++  Array<uint16_t> supported_groups;
++  Array<uint16_t> key_share_groups;
++  Array<uint8_t> psk_key_exchange_modes;
++  Array<uint16_t> extension_order;
++  enum ssl_ja4_mode_t extension_mode = ssl_ja4_mode_none;
++  enum ssl_ja4_sni_mode_t sni_mode = ssl_ja4_sni_unset;
++  bool grease_set = false;
++  bool grease_enabled = false;
++  bool grease_value_set = false;
++  uint16_t grease_value = 0;
++  bool enable_ch_xtn_permutation_set = false;
++  bool enable_ch_xtn_permutation = false;
++
++  bool apply_ok = true;
++  uint32_t mismatch_mask = 0;
++  bool parsed_once = false;
++
++  Array<uint16_t> final_cipher_suites;
++  Array<uint8_t> final_alpn_wire;
++  Array<uint16_t> final_signature_algorithms;
++  Array<uint16_t> final_extensions;
++  Array<uint16_t> final_supported_versions;
++  Array<uint16_t> final_supported_groups;
++  Array<uint16_t> final_key_share_groups;
++  Array<uint8_t> final_psk_key_exchange_modes;
++
++  // synthetic_sent tracks ClientHello extension types that were emitted via
++  // the JA4 synthetic-extension constructor (no native BoringSSL builder).
++  // Reset per ClientHello in |ssl_add_clienthello_tlsext|.
++  Array<uint16_t> synthetic_sent;
++};
++
+ struct SSL_HANDSHAKE {
+   explicit SSL_HANDSHAKE(SSL *ssl);
+   ~SSL_HANDSHAKE();
+@@ -1838,6 +1916,10 @@ struct SSL_HANDSHAKE {
+   // indices.
+   Array<uint8_t> extension_permutation;
+ 
++  // ja4 contains optional runtime overrides used to shape ClientHello behavior
++  // for reproducible JA4 experiments.
++  SSLJA4Config ja4;
++
+   // cert_compression_alg_id, for a server, contains the negotiated certificate
+   // compression algorithm for this client. It is only valid if
+   // |cert_compression_negotiated| is true.
+@@ -2180,7 +2262,7 @@ bool ssl_is_sct_list_valid(const CBS *contents);
+ // ssl_write_client_hello_without_extensions writes a ClientHello to |out|,
+ // up to the extensions field. |type| determines the type of ClientHello to
+ // write. If |omit_session_id| is true, the session ID is empty.
+-bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
++bool ssl_write_client_hello_without_extensions(SSL_HANDSHAKE *hs,
+                                                CBB *cbb,
+                                                ssl_client_hello_type_t type,
+                                                bool empty_session_id);
+@@ -3644,6 +3726,20 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+                                 ssl_client_hello_type_t type,
+                                 size_t header_len);
+ 
++bool ssl_ja4_prepare_client_hello(SSL_HANDSHAKE *hs);
++bool ssl_ja4_should_enable_grease(const SSL_HANDSHAKE *hs);
++bool ssl_ja4_should_emit_standalone_grease_extensions(const SSL_HANDSHAKE *hs);
++void ssl_ja4_capture_client_hello(SSL_HANDSHAKE *hs,
++                                  Span<const uint8_t> message);
++void ssl_ja4_note_cipher(SSL_HANDSHAKE *hs, uint16_t cipher_id);
++void ssl_ja4_note_signature_algorithm(SSL_HANDSHAKE *hs, uint16_t sigalg_id);
++void ssl_ja4_note_extension(SSL_HANDSHAKE *hs, uint16_t extension_type);
++void ssl_ja4_note_supported_version(SSL_HANDSHAKE *hs, uint16_t version);
++void ssl_ja4_note_supported_group(SSL_HANDSHAKE *hs, uint16_t group_id);
++void ssl_ja4_note_keyshare_group(SSL_HANDSHAKE *hs, uint16_t group_id);
++void ssl_ja4_note_psk_mode(SSL_HANDSHAKE *hs, uint8_t mode);
++void ssl_ja4_write_dump(SSL_HANDSHAKE *hs);
++
+ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out);
+ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
+                                   const SSL_CLIENT_HELLO *client_hello);
+diff --git a/ssl/ssl_versions.cc b/ssl/ssl_versions.cc
+index 31fd241d3..25aba0de8 100644
+--- a/ssl/ssl_versions.cc
++++ b/ssl/ssl_versions.cc
+@@ -298,6 +298,38 @@ bool ssl_supports_version(const SSL_HANDSHAKE *hs, uint16_t version) {
+ 
+ bool ssl_add_supported_versions(const SSL_HANDSHAKE *hs, CBB *cbb,
+                                 uint16_t extra_min_version) {
++  if (!hs->ja4.supported_versions.empty()) {
++    bool wrote_any = false;
++    SSL_HANDSHAKE *mutable_hs = const_cast<SSL_HANDSHAKE *>(hs);
++    for (uint16_t version : hs->ja4.supported_versions) {
++      uint16_t protocol_version;
++      if (!ssl_method_supports_version(hs->ssl->method, version) ||
++          !ssl_protocol_version_from_wire(&protocol_version, version) ||
++          hs->min_version > protocol_version ||
++          protocol_version > hs->max_version ||
++          protocol_version < extra_min_version) {
++        mutable_hs->ja4.apply_ok = false;
++        mutable_hs->ja4.mismatch_mask |= ssl_ja4_mismatch_supported_versions;
++        if (hs->ja4.strict_enabled) {
++          OPENSSL_PUT_ERROR(SSL, SSL_R_NO_SUPPORTED_VERSIONS_ENABLED);
++          return false;
++        }
++        continue;
++      }
++
++      if (!CBB_add_u16(cbb, version)) {
++        return false;
++      }
++      wrote_any = true;
++    }
++
++    if (!wrote_any) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_NO_SUPPORTED_VERSIONS_ENABLED);
++      return false;
++    }
++    return true;
++  }
++
+   for (uint16_t version : get_method_versions(hs->ssl->method)) {
+     uint16_t protocol_version;
+     if (ssl_supports_version(hs, version) &&
+-- 
+2.50.1 (Apple Git-155)
+

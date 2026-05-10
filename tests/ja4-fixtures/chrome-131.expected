@@ -1,0 +1,7 @@
+# Expected dump assertions for chrome-131.conf.
+# ja4-fixture-format: v1
+expected_ja4=t13d1514h2_8daaf6152771_f4a12238b100
+mismatch_mask=0
+apply_ok=1
+require_requested_eq_final=cipher_suites,alpn,signature_algorithms,extension_order,supported_versions,supported_groups,key_share_groups,psk_key_exchange_modes
+require_dump_keys_match_schema=1

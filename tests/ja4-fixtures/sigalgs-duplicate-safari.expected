@@ -1,0 +1,11 @@
+# Expected dump assertions for sigalgs-duplicate-safari.conf.
+# Contract: requested_signature_algorithms MUST round-trip verbatim into
+# final_signature_algorithms across all three libs. The duplicate 0x0805
+# (decimal 2053) at positions 5+6 must appear twice in final too — if
+# any lib dedupes it the assertion fails and points us at the offender.
+# ja4-fixture-format: v1
+expected_ja4=auto-baseline
+mismatch_mask=0
+apply_ok=1
+require_requested_eq_final=cipher_suites,extension_order,signature_algorithms,supported_versions,supported_groups,key_share_groups,psk_key_exchange_modes
+require_dump_keys_match_schema=1

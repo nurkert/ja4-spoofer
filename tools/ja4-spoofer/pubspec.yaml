@@ -1,0 +1,55 @@
+name: ja4_spoofer
+description: "Desktop GUI for building and launching apps with configurable JA4 TLS fingerprints."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.8
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  shadcn_ui: ^0.46.1
+  csv: ^7.1.0
+  yaml: ^3.1.2
+  file_picker: ^8.1.7
+  cached_network_image: ^3.4.1
+  flutter_cache_manager: ^3.4.1
+  flutter_svg: ^2.0.17
+  http: ^1.2.0
+  crypto: ^3.0.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.3
+
+flutter_launcher_icons:
+  image_path: "assets/icon.png"
+  macos:
+    generate: true
+    image_path: "assets/icon.png"
+  windows:
+    generate: true
+    image_path: "assets/icon.png"
+  linux:
+    generate: true
+    image_path: "assets/icon.png"
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/descriptors/
+    - assets/seed-profiles/
+    - assets/bundled-runtime/scripts/
+    - assets/bundled-runtime/scripts/lib/
+    - assets/bundled-runtime/scripts/browsers/
+    - assets/bundled-runtime/configs/
+    - assets/bundled-runtime/patches/boringssl/
+    - assets/bundled-runtime/patches/nss/
+    - assets/bundled-runtime/patches/openssl/
+    - assets/iana/

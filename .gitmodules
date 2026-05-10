@@ -1,0 +1,24 @@
+[submodule "libs/openssl"]
+	path = libs/openssl
+	url = https://github.com/openssl/openssl.git
+	ignore = all
+[submodule "libs/boringssl"]
+	path = libs/boringssl
+	url = https://github.com/google/boringssl.git
+	ignore = all
+[submodule "libs/ja4"]
+	path = libs/ja4
+	url = https://github.com/FoxIO-LLC/ja4
+	ignore = all
+[submodule "libs/ja4-nginx-module"]
+	path = libs/ja4-nginx-module
+	url = https://github.com/FoxIO-LLC/ja4-nginx-module
+	ignore = all
+[submodule "libs/nginx"]
+	path = libs/nginx
+	url = https://github.com/nginx/nginx
+	ignore = all
+[submodule "libs/nss"]
+	path = libs/nss
+	url = https://github.com/nss-dev/nss
+	ignore = all

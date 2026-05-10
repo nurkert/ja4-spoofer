@@ -1,0 +1,10 @@
+# Expected dump assertions for lying-phase3.conf.
+# Phase-3 EXACT-mode lying contract: requested_cipher_suites and
+# requested_extension_order MUST round-trip verbatim into final_*; the
+# fake IDs (65278, 43981) appear at their cfg-defined positions.
+# ja4-fixture-format: v1
+expected_ja4=auto-baseline
+mismatch_mask=0
+apply_ok=1
+require_requested_eq_final=cipher_suites,extension_order,signature_algorithms,supported_versions,supported_groups,key_share_groups,psk_key_exchange_modes
+require_dump_keys_match_schema=1

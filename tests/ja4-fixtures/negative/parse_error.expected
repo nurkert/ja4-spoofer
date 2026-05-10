@@ -1,0 +1,4 @@
+# ja4-fixture-format: v1
+expect_mismatch_bit=0x0001
+expect_apply_ok=0
+expect_strict_handshake_fail=0

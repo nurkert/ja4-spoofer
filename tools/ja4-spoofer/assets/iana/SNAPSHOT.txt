@@ -1,0 +1,10 @@
+IANA TLS registry snapshot bundled with JA4 Spoofer.
+
+Captured: 2026-04-30
+Sources:
+  tls-parameters-4.csv          https://www.iana.org/assignments/tls-parameters/tls-parameters-4.csv
+  tls-extensiontype-values-1.csv https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values-1.csv
+  tls-signaturescheme.csv       https://www.iana.org/assignments/tls-parameters/tls-signaturescheme.csv
+
+Selected via Settings -> Privacy / Network -> "IANA registry source".
+Refresh: re-run the curl commands above (or pick "Online (iana.org)" in the GUI to fetch fresh CSVs at runtime).

@@ -1,0 +1,2377 @@
+From 6a72e274a7ebbfc7b1aec1d86ac0d630361ac334 Mon Sep 17 00:00:00 2001
+From: Niko Burkert <nurkert@local>
+Date: Sun, 10 May 2026 13:43:27 +0200
+Subject: [PATCH] add JA4 ClientHello spoofing for NSS
+
+---
+ lib/ssl/ssl3con.c | 2275 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 2267 insertions(+), 8 deletions(-)
+
+diff --git a/lib/ssl/ssl3con.c b/lib/ssl/ssl3con.c
+index 173eca7b1..1b2a13c2e 100644
+--- a/lib/ssl/ssl3con.c
++++ b/lib/ssl/ssl3con.c
+@@ -21,6 +21,7 @@
+ #include "sslerr.h"
+ #include "ssl3ext.h"
+ #include "ssl3exthandle.h"
++#include "tls13con.h"
+ #include "tls13ech.h"
+ #include "tls13exthandle.h"
+ #include "tls13psk.h"
+@@ -37,8 +38,11 @@
+ #include "secmod.h"
+ #include "blapi.h"
+ 
++#include <ctype.h>
+ #include <limits.h>
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ static PK11SymKey *ssl3_GenerateRSAPMS(sslSocket *ss, ssl3CipherSpec *spec,
+                                        PK11SlotInfo *serverKeySlot);
+@@ -85,6 +89,2187 @@ const PRUint8 ssl_hello_retry_random[] = {
+ };
+ PR_STATIC_ASSERT(PR_ARRAY_SIZE(ssl_hello_retry_random) == SSL3_RANDOM_LENGTH);
+ 
++/* Minimal JA4 config/dump hook:
++ *   NSS_JA4_CONFIG=/path/file.conf
++ *   NSS_JA4_DUMP=/path/file.conf
++ */
++#define SSL3_JA4_CFG_MAX_LIST 256
++#define SSL3_JA4_CFG_MAX_ALPN 4096
++#define SSL3_JA4_CFG_MAX_UNKNOWN_KEY 64
++
++typedef enum {
++    ssl3Ja4CipherModeReorder = 0,
++    ssl3Ja4CipherModeExact = 1
++} ssl3Ja4CipherMode;
++
++typedef enum {
++    ssl3Ja4ExtensionModeReorder = 0,
++    ssl3Ja4ExtensionModeExact = 1
++} ssl3Ja4ExtensionMode;
++
++typedef enum {
++    ssl3Ja4SniUnset = 0,
++    ssl3Ja4SniPresent,
++    ssl3Ja4SniDomain,
++    ssl3Ja4SniNone,
++    ssl3Ja4SniIp
++} ssl3Ja4SniMode;
++
++typedef struct {
++    PRBool strict;
++
++    PRBool hasCipherSuites;
++    unsigned int cipherSuiteCount;
++    ssl3CipherSuite cipherSuites[ssl_V3_SUITES_IMPLEMENTED];
++    PRBool hasCipherMode;
++    ssl3Ja4CipherMode cipherMode;
++
++    PRBool hasAlpn;
++    unsigned int alpnLen;
++    unsigned char alpn[SSL3_JA4_CFG_MAX_ALPN];
++
++    PRBool hasEnableGrease;
++    PRBool enableGrease;
++
++    PRBool greaseValueSet;
++    PRUint16 greaseValue;
++
++    PRBool hasEnableChXtnPermutation;
++    PRBool enableChXtnPermutation;
++
++    PRBool hasTlsMin;
++    PRUint16 tlsMin;
++
++    PRBool hasTlsMax;
++    PRUint16 tlsMax;
++
++    PRBool hasSupportedVersions;
++    unsigned int supportedVersionCount;
++    PRUint16 supportedVersions[SSL3_JA4_CFG_MAX_LIST];
++
++    PRBool hasExtensionOrder;
++    unsigned int extensionCount;
++    PRUint16 extensions[SSL3_JA4_CFG_MAX_LIST];
++    PRBool hasExtensionMode;
++    ssl3Ja4ExtensionMode extensionMode;
++
++    PRBool hasSupportedGroups;
++    unsigned int supportedGroupCount;
++    PRUint16 supportedGroups[SSL3_JA4_CFG_MAX_LIST];
++
++    PRBool hasKeyShareGroups;
++    unsigned int keyShareGroupCount;
++    PRUint16 keyShareGroups[SSL3_JA4_CFG_MAX_LIST];
++
++    PRBool hasPskKeyExchangeModes;
++    unsigned int pskKeyExchangeModeCount;
++    PRUint8 pskKeyExchangeModes[SSL3_JA4_CFG_MAX_LIST];
++
++    PRBool hasSignatureSchemes;
++    unsigned int signatureSchemeCount;
++    SSLSignatureScheme signatureSchemes[MAX_SIGNATURE_SCHEMES];
++
++    PRBool hasSniMode;
++    PRBool sniPresent;
++    ssl3Ja4SniMode sniMode;
++
++    unsigned int unknownKeyCount;
++    char firstUnknownKey[SSL3_JA4_CFG_MAX_UNKNOWN_KEY];
++
++    PRUint32 mismatchMask;
++} ssl3Ja4SlimConfig;
++
++typedef struct {
++    PRUint16 type;
++    unsigned int offset;
++    unsigned int length;
++} ssl3Ja4ExtensionView;
++
++/* JA4 diagnostic mismatch bitmask v1.
++ * Bits frozen by docs/ja4-diagnostic-schema.md; shared with OpenSSL/BoringSSL. */
++typedef enum {
++    ssl3Ja4MismatchParse = 0x0001u,
++    ssl3Ja4MismatchApply = 0x0002u,
++    ssl3Ja4MismatchKeyShareGroups = 0x0004u,
++    ssl3Ja4MismatchSupportedVersions = 0x0008u,
++    ssl3Ja4MismatchUnknownKey = 0x0010u,
++    ssl3Ja4MismatchInvalidConfig = 0x0020u,
++    ssl3Ja4MismatchMissingExtension = 0x0040u,
++    ssl3Ja4MismatchCipherSuites = 0x0080u,
++    ssl3Ja4MismatchAlpn = 0x0100u,
++    ssl3Ja4MismatchSignatureSchemes = 0x0200u,
++    ssl3Ja4MismatchExtensions = 0x0400u,
++    ssl3Ja4MismatchSupportedGroups = 0x0800u,
++    ssl3Ja4MismatchPskKeyExchangeModes = 0x1000u
++} ssl3Ja4Mismatch;
++
++static PRBool
++ssl3_Ja4ParseExtensionBuffer(const sslBuffer *extensionBuf,
++                             ssl3Ja4ExtensionView *out,
++                             unsigned int maxCount,
++                             unsigned int *outCount);
++
++static PRBool
++ssl3_Ja4FindExtension(const sslBuffer *extensionBuf, PRUint16 type,
++                      ssl3Ja4ExtensionView *view);
++
++static SECStatus
++ssl3_Ja4RewriteTls13ExtensionBodies(sslSocket *ss,
++                                    const ssl3Ja4SlimConfig *cfg,
++                                    sslBuffer *extensionBuf);
++
++static PRBool
++ssl3_Ja4UseExtensionModeReorder(const ssl3Ja4SlimConfig *cfg)
++{
++    return !cfg->hasExtensionMode ||
++           cfg->extensionMode == ssl3Ja4ExtensionModeReorder;
++}
++
++static PRBool
++ssl3_Ja4UseExtensionModeExact(const ssl3Ja4SlimConfig *cfg)
++{
++    return cfg->hasExtensionMode &&
++           cfg->extensionMode == ssl3Ja4ExtensionModeExact;
++}
++
++static char *
++ssl3_Ja4Trim(char *s)
++{
++    char *end;
++
++    while (*s && isspace((unsigned char)*s)) {
++        ++s;
++    }
++    if (!*s) {
++        return s;
++    }
++
++    end = s + strlen(s) - 1;
++    while (end > s && isspace((unsigned char)*end)) {
++        *end = '\0';
++        --end;
++    }
++    return s;
++}
++
++static PRBool
++ssl3_Ja4ParseBool(const char *value, PRBool *out)
++{
++    if (!strcmp(value, "1") || !strcmp(value, "true") ||
++        !strcmp(value, "on") || !strcmp(value, "yes")) {
++        *out = PR_TRUE;
++        return PR_TRUE;
++    }
++
++    if (!strcmp(value, "0") || !strcmp(value, "false") ||
++        !strcmp(value, "off") || !strcmp(value, "no")) {
++        *out = PR_FALSE;
++        return PR_TRUE;
++    }
++
++    return PR_FALSE;
++}
++
++static PRBool
++ssl3_Ja4ParseCipherMode(const char *value, ssl3Ja4SlimConfig *cfg)
++{
++    if (!strcmp(value, "reorder")) {
++        cfg->hasCipherMode = PR_TRUE;
++        cfg->cipherMode = ssl3Ja4CipherModeReorder;
++        return PR_TRUE;
++    }
++    if (!strcmp(value, "exact")) {
++        cfg->hasCipherMode = PR_TRUE;
++        cfg->cipherMode = ssl3Ja4CipherModeExact;
++        return PR_TRUE;
++    }
++    return PR_FALSE;
++}
++
++static PRBool
++ssl3_Ja4ParseExtensionMode(const char *value, ssl3Ja4SlimConfig *cfg)
++{
++    if (!strcmp(value, "reorder")) {
++        cfg->hasExtensionMode = PR_TRUE;
++        cfg->extensionMode = ssl3Ja4ExtensionModeReorder;
++        return PR_TRUE;
++    }
++    if (!strcmp(value, "exact")) {
++        cfg->hasExtensionMode = PR_TRUE;
++        cfg->extensionMode = ssl3Ja4ExtensionModeExact;
++        return PR_TRUE;
++    }
++    return PR_FALSE;
++}
++
++static PRBool
++ssl3_Ja4ParseTlsVersion(const char *value, PRUint16 *out)
++{
++    char *endptr;
++    unsigned long v;
++
++    if (!strcmp(value, "1.0")) {
++        *out = SSL_LIBRARY_VERSION_TLS_1_0;
++        return PR_TRUE;
++    }
++    if (!strcmp(value, "1.1")) {
++        *out = SSL_LIBRARY_VERSION_TLS_1_1;
++        return PR_TRUE;
++    }
++    if (!strcmp(value, "1.2")) {
++        *out = SSL_LIBRARY_VERSION_TLS_1_2;
++        return PR_TRUE;
++    }
++    if (!strcmp(value, "1.3")) {
++        *out = SSL_LIBRARY_VERSION_TLS_1_3;
++        return PR_TRUE;
++    }
++
++    v = strtoul(value, &endptr, 0);
++    if (endptr == value || *endptr != '\0' || v > 0xFFFF) {
++        return PR_FALSE;
++    }
++
++    *out = (PRUint16)v;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseU16List(char *value, PRUint16 *out, unsigned int maxCount,
++                     unsigned int *outCount)
++{
++    char *cursor = value;
++
++    *outCount = 0;
++
++    while (*cursor) {
++        char *endptr;
++        unsigned long parsed;
++
++        while (*cursor && (isspace((unsigned char)*cursor) || *cursor == ',')) {
++            ++cursor;
++        }
++        if (!*cursor) {
++            break;
++        }
++
++        parsed = strtoul(cursor, &endptr, 0);
++        if (endptr == cursor || parsed > 0xFFFF || *outCount >= maxCount) {
++            return PR_FALSE;
++        }
++        out[(*outCount)++] = (PRUint16)parsed;
++        cursor = endptr;
++
++        while (*cursor && isspace((unsigned char)*cursor)) {
++            ++cursor;
++        }
++        if (*cursor == ',') {
++            ++cursor;
++        } else if (*cursor != '\0') {
++            return PR_FALSE;
++        }
++    }
++
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseU8List(char *value, PRUint8 *out, unsigned int maxCount,
++                    unsigned int *outCount)
++{
++    char *cursor = value;
++
++    *outCount = 0;
++
++    while (*cursor) {
++        char *endptr;
++        unsigned long parsed;
++
++        while (*cursor && (isspace((unsigned char)*cursor) || *cursor == ',')) {
++            ++cursor;
++        }
++        if (!*cursor) {
++            break;
++        }
++
++        parsed = strtoul(cursor, &endptr, 0);
++        if (endptr == cursor || parsed > 0xFF || *outCount >= maxCount) {
++            return PR_FALSE;
++        }
++        out[(*outCount)++] = (PRUint8)parsed;
++        cursor = endptr;
++
++        while (*cursor && isspace((unsigned char)*cursor)) {
++            ++cursor;
++        }
++        if (*cursor == ',') {
++            ++cursor;
++        } else if (*cursor != '\0') {
++            return PR_FALSE;
++        }
++    }
++
++    return PR_TRUE;
++}
++
++static void
++ssl3_Ja4RememberUnknownKey(ssl3Ja4SlimConfig *cfg, const char *key)
++{
++    ++cfg->unknownKeyCount;
++    cfg->mismatchMask |= ssl3Ja4MismatchUnknownKey;
++    if (!cfg->firstUnknownKey[0]) {
++        PORT_Strncpy(cfg->firstUnknownKey, key, sizeof(cfg->firstUnknownKey) - 1);
++        cfg->firstUnknownKey[sizeof(cfg->firstUnknownKey) - 1] = '\0';
++    }
++}
++
++static PRBool
++ssl3_Ja4ParseCipherSuites(char *value, ssl3Ja4SlimConfig *cfg)
++{
++    PRUint16 parsed[ssl_V3_SUITES_IMPLEMENTED];
++    unsigned int count = 0;
++    unsigned int i;
++
++    if (!ssl3_Ja4ParseU16List(value, parsed, PR_ARRAY_SIZE(parsed), &count)) {
++        return PR_FALSE;
++    }
++
++    cfg->hasCipherSuites = PR_TRUE;
++    cfg->cipherSuiteCount = count;
++    for (i = 0; i < count; ++i) {
++        cfg->cipherSuites[i] = (ssl3CipherSuite)parsed[i];
++    }
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseAlpn(char *value, ssl3Ja4SlimConfig *cfg)
++{
++    char *cursor = value;
++
++    cfg->hasAlpn = PR_TRUE;
++    cfg->alpnLen = 0;
++
++    while (*cursor) {
++        char *start;
++        char *end;
++        unsigned int len;
++
++        while (*cursor && (isspace((unsigned char)*cursor) || *cursor == ',')) {
++            ++cursor;
++        }
++        if (!*cursor) {
++            break;
++        }
++
++        start = cursor;
++        while (*cursor && *cursor != ',') {
++            ++cursor;
++        }
++        end = cursor;
++        while (end > start && isspace((unsigned char)end[-1])) {
++            --end;
++        }
++
++        len = (unsigned int)(end - start);
++        if (len == 0 || len > 255 ||
++            (cfg->alpnLen + 1 + len) > sizeof(cfg->alpn)) {
++            return PR_FALSE;
++        }
++
++        cfg->alpn[cfg->alpnLen++] = (unsigned char)len;
++        PORT_Memcpy(cfg->alpn + cfg->alpnLen, start, len);
++        cfg->alpnLen += len;
++    }
++
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseExtensionOrder(char *value, ssl3Ja4SlimConfig *cfg)
++{
++    if (!ssl3_Ja4ParseU16List(value, cfg->extensions, PR_ARRAY_SIZE(cfg->extensions),
++                              &cfg->extensionCount)) {
++        return PR_FALSE;
++    }
++    if (cfg->extensionCount == 0) {
++        return PR_FALSE;
++    }
++
++    cfg->hasExtensionOrder = PR_TRUE;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseSupportedVersions(char *value, ssl3Ja4SlimConfig *cfg)
++{
++    if (!ssl3_Ja4ParseU16List(value, cfg->supportedVersions,
++                              PR_ARRAY_SIZE(cfg->supportedVersions),
++                              &cfg->supportedVersionCount)) {
++        return PR_FALSE;
++    }
++    if (cfg->supportedVersionCount == 0) {
++        return PR_FALSE;
++    }
++
++    cfg->hasSupportedVersions = PR_TRUE;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseSupportedGroups(char *value, ssl3Ja4SlimConfig *cfg)
++{
++    if (!ssl3_Ja4ParseU16List(value, cfg->supportedGroups,
++                              PR_ARRAY_SIZE(cfg->supportedGroups),
++                              &cfg->supportedGroupCount)) {
++        return PR_FALSE;
++    }
++    if (cfg->supportedGroupCount == 0) {
++        return PR_FALSE;
++    }
++
++    cfg->hasSupportedGroups = PR_TRUE;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseKeyShareGroups(char *value, ssl3Ja4SlimConfig *cfg)
++{
++    if (!ssl3_Ja4ParseU16List(value, cfg->keyShareGroups,
++                              PR_ARRAY_SIZE(cfg->keyShareGroups),
++                              &cfg->keyShareGroupCount)) {
++        return PR_FALSE;
++    }
++    if (cfg->keyShareGroupCount == 0) {
++        return PR_FALSE;
++    }
++
++    cfg->hasKeyShareGroups = PR_TRUE;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParsePskKeyExchangeModes(char *value, ssl3Ja4SlimConfig *cfg)
++{
++    if (!ssl3_Ja4ParseU8List(value, cfg->pskKeyExchangeModes,
++                             PR_ARRAY_SIZE(cfg->pskKeyExchangeModes),
++                             &cfg->pskKeyExchangeModeCount)) {
++        return PR_FALSE;
++    }
++    if (cfg->pskKeyExchangeModeCount == 0) {
++        return PR_FALSE;
++    }
++
++    cfg->hasPskKeyExchangeModes = PR_TRUE;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseSignatureSchemes(char *value, ssl3Ja4SlimConfig *cfg)
++{
++    PRUint16 parsed[MAX_SIGNATURE_SCHEMES];
++    unsigned int count = 0;
++    unsigned int i;
++
++    if (!ssl3_Ja4ParseU16List(value, parsed, PR_ARRAY_SIZE(parsed), &count)) {
++        return PR_FALSE;
++    }
++
++    cfg->hasSignatureSchemes = PR_TRUE;
++    cfg->signatureSchemeCount = 0;
++    for (i = 0; i < count; ++i) {
++        SSLSignatureScheme scheme = (SSLSignatureScheme)parsed[i];
++        if (ssl_IsSupportedSignatureScheme(scheme)) {
++            cfg->signatureSchemes[cfg->signatureSchemeCount++] = scheme;
++        }
++    }
++
++    return cfg->signatureSchemeCount > 0;
++}
++
++static const char *
++ssl3_Ja4SniModeStr(ssl3Ja4SniMode mode)
++{
++    switch (mode) {
++        case ssl3Ja4SniPresent:
++            return "present";
++        case ssl3Ja4SniDomain:
++            return "domain";
++        case ssl3Ja4SniNone:
++            return "none";
++        case ssl3Ja4SniIp:
++            return "ip";
++        case ssl3Ja4SniUnset:
++            break;
++    }
++    return "unset";
++}
++
++static PRBool
++ssl3_Ja4SniModeEmit(ssl3Ja4SniMode mode)
++{
++    return mode == ssl3Ja4SniPresent ||
++           mode == ssl3Ja4SniDomain ||
++           mode == ssl3Ja4SniIp;
++}
++
++static PRBool
++ssl3_Ja4ParseSniMode(const char *value, ssl3Ja4SlimConfig *cfg)
++{
++    ssl3Ja4SniMode mode;
++    if (!strcmp(value, "present")) {
++        mode = ssl3Ja4SniPresent;
++    } else if (!strcmp(value, "domain")) {
++        mode = ssl3Ja4SniDomain;
++    } else if (!strcmp(value, "none")) {
++        mode = ssl3Ja4SniNone;
++    } else if (!strcmp(value, "ip")) {
++        mode = ssl3Ja4SniIp;
++    } else {
++        return PR_FALSE;
++    }
++    cfg->hasSniMode = PR_TRUE;
++    cfg->sniMode = mode;
++    cfg->sniPresent = ssl3_Ja4SniModeEmit(mode);
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ParseConfigEntry(ssl3Ja4SlimConfig *cfg, const char *key, char *value)
++{
++    PRBool parsedBool;
++    PRUint16 parsedVersion;
++
++    if (!strcmp(key, "cipher_suites")) {
++        return ssl3_Ja4ParseCipherSuites(value, cfg);
++    }
++
++    if (!strcmp(key, "cipher_mode")) {
++        return ssl3_Ja4ParseCipherMode(value, cfg);
++    }
++
++    if (!strcmp(key, "alpn")) {
++        return ssl3_Ja4ParseAlpn(value, cfg);
++    }
++
++    if (!strcmp(key, "extension_order") || !strcmp(key, "extensions")) {
++        return ssl3_Ja4ParseExtensionOrder(value, cfg);
++    }
++
++    if (!strcmp(key, "extension_mode")) {
++        return ssl3_Ja4ParseExtensionMode(value, cfg);
++    }
++
++    if (!strcmp(key, "signature_algorithms") || !strcmp(key, "signature_schemes")) {
++        return ssl3_Ja4ParseSignatureSchemes(value, cfg);
++    }
++
++    if (!strcmp(key, "sni_mode")) {
++        return ssl3_Ja4ParseSniMode(value, cfg);
++    }
++
++    if (!strcmp(key, "enable_ch_xtn_permutation")) {
++        if (!ssl3_Ja4ParseBool(value, &parsedBool)) {
++            return PR_FALSE;
++        }
++        cfg->hasEnableChXtnPermutation = PR_TRUE;
++        cfg->enableChXtnPermutation = parsedBool;
++        return PR_TRUE;
++    }
++
++    if (!strcmp(key, "enable_grease")) {
++        if (!ssl3_Ja4ParseBool(value, &parsedBool)) {
++            return PR_FALSE;
++        }
++        cfg->hasEnableGrease = PR_TRUE;
++        cfg->enableGrease = parsedBool;
++        return PR_TRUE;
++    }
++
++    if (!strcmp(key, "grease_value")) {
++        char *endptr;
++        unsigned long parsed = strtoul(value, &endptr, 0);
++        if (endptr == value || *endptr != '\0' || parsed > 0xFFFFu) {
++            return PR_FALSE;
++        }
++        cfg->greaseValueSet = PR_TRUE;
++        cfg->greaseValue = (PRUint16)parsed;
++        return PR_TRUE;
++    }
++
++    if (!strcmp(key, "strict")) {
++        if (!ssl3_Ja4ParseBool(value, &parsedBool)) {
++            return PR_FALSE;
++        }
++        cfg->strict = parsedBool;
++        return PR_TRUE;
++    }
++
++    if (!strcmp(key, "tls_min")) {
++        if (!ssl3_Ja4ParseTlsVersion(value, &parsedVersion)) {
++            return PR_FALSE;
++        }
++        cfg->hasTlsMin = PR_TRUE;
++        cfg->tlsMin = parsedVersion;
++        return PR_TRUE;
++    }
++
++    if (!strcmp(key, "tls_max")) {
++        if (!ssl3_Ja4ParseTlsVersion(value, &parsedVersion)) {
++            return PR_FALSE;
++        }
++        cfg->hasTlsMax = PR_TRUE;
++        cfg->tlsMax = parsedVersion;
++        return PR_TRUE;
++    }
++
++    if (!strcmp(key, "supported_versions")) {
++        return ssl3_Ja4ParseSupportedVersions(value, cfg);
++    }
++
++    if (!strcmp(key, "supported_groups")) {
++        return ssl3_Ja4ParseSupportedGroups(value, cfg);
++    }
++
++    if (!strcmp(key, "key_share_groups")) {
++        return ssl3_Ja4ParseKeyShareGroups(value, cfg);
++    }
++
++    if (!strcmp(key, "psk_key_exchange_modes")) {
++        return ssl3_Ja4ParsePskKeyExchangeModes(value, cfg);
++    }
++
++    ssl3_Ja4RememberUnknownKey(cfg, key);
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4ValidateConfig(ssl3Ja4SlimConfig *cfg)
++{
++    unsigned int i;
++
++    if (cfg->hasTlsMin && cfg->hasTlsMax && cfg->tlsMin > cfg->tlsMax) {
++        cfg->mismatchMask |= ssl3Ja4MismatchInvalidConfig;
++        return PR_FALSE;
++    }
++
++    if (cfg->strict && cfg->unknownKeyCount) {
++        return PR_FALSE;
++    }
++
++    if (cfg->hasCipherMode &&
++        cfg->cipherMode == ssl3Ja4CipherModeExact &&
++        (!cfg->hasCipherSuites || cfg->cipherSuiteCount == 0)) {
++        cfg->mismatchMask |= ssl3Ja4MismatchInvalidConfig;
++        return PR_FALSE;
++    }
++
++    if (cfg->hasExtensionMode &&
++        cfg->extensionMode == ssl3Ja4ExtensionModeExact &&
++        !cfg->hasExtensionOrder) {
++        cfg->mismatchMask |= ssl3Ja4MismatchInvalidConfig;
++        return PR_FALSE;
++    }
++
++    for (i = 0; i < cfg->supportedGroupCount; ++i) {
++        if (!ssl_LookupNamedGroup((SSLNamedGroup)cfg->supportedGroups[i])) {
++            return PR_FALSE;
++        }
++    }
++
++    for (i = 0; i < cfg->keyShareGroupCount; ++i) {
++        if (!ssl_LookupNamedGroup((SSLNamedGroup)cfg->keyShareGroups[i])) {
++            return PR_FALSE;
++        }
++    }
++
++    if (cfg->hasSupportedGroups && cfg->hasKeyShareGroups) {
++        for (i = 0; i < cfg->keyShareGroupCount; ++i) {
++            unsigned int j;
++            PRBool found = PR_FALSE;
++            for (j = 0; j < cfg->supportedGroupCount; ++j) {
++                if (cfg->keyShareGroups[i] == cfg->supportedGroups[j]) {
++                    found = PR_TRUE;
++                    break;
++                }
++            }
++            if (!found) {
++                cfg->mismatchMask |= ssl3Ja4MismatchInvalidConfig;
++                return PR_FALSE;
++            }
++        }
++    }
++
++    /* Phase 2 dependency closure: when a body override is configured but the
++     * corresponding extension id is missing from an explicit
++     * requested_extension_order, silently append it (before any pre_shared_key
++     * entry, since PSK must remain last per RFC 8446 sec. 4.2.11). Without
++     * this, a config like supported_versions=... combined with
++     * extension_mode=exact would raise ssl3Ja4MismatchExtensions even though
++     * the missing id is fully implied by the rest of the config. */
++    if (cfg->hasExtensionOrder) {
++        static const PRUint16 kClosureTypes[] = {
++            0x000d, /* signature_algorithms     <- hasSignatureSchemes */
++            0x000a, /* supported_groups         <- hasSupportedGroups */
++            0x0033, /* key_share                <- hasKeyShareGroups */
++            0x002b, /* supported_versions       <- hasSupportedVersions */
++            0x002d, /* psk_key_exchange_modes   <- hasPskKeyExchangeModes */
++            0x0010, /* alpn                     <- hasAlpn */
++            0x0000  /* server_name              <- hasSniMode && sniPresent */
++        };
++        PRBool needed[PR_ARRAY_SIZE(kClosureTypes)];
++        unsigned int c;
++
++        needed[0] = cfg->hasSignatureSchemes;
++        needed[1] = cfg->hasSupportedGroups;
++        needed[2] = cfg->hasKeyShareGroups;
++        needed[3] = cfg->hasSupportedVersions;
++        needed[4] = cfg->hasPskKeyExchangeModes;
++        needed[5] = cfg->hasAlpn;
++        needed[6] = cfg->hasSniMode && cfg->sniPresent;
++
++        for (c = 0; c < PR_ARRAY_SIZE(kClosureTypes); ++c) {
++            PRBool already;
++            unsigned int k;
++            unsigned int insertAt;
++
++            if (!needed[c]) {
++                continue;
++            }
++            already = PR_FALSE;
++            for (k = 0; k < cfg->extensionCount; ++k) {
++                if (cfg->extensions[k] == kClosureTypes[c]) {
++                    already = PR_TRUE;
++                    break;
++                }
++            }
++            if (already) {
++                continue;
++            }
++            if (cfg->extensionCount >= PR_ARRAY_SIZE(cfg->extensions)) {
++                break;
++            }
++            insertAt = cfg->extensionCount;
++            for (k = 0; k < cfg->extensionCount; ++k) {
++                if (cfg->extensions[k] == ssl_tls13_pre_shared_key_xtn) {
++                    insertAt = k;
++                    break;
++                }
++            }
++            for (k = cfg->extensionCount; k > insertAt; --k) {
++                cfg->extensions[k] = cfg->extensions[k - 1];
++            }
++            cfg->extensions[insertAt] = kClosureTypes[c];
++            ++cfg->extensionCount;
++        }
++    }
++
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4LoadConfig(const char *path, ssl3Ja4SlimConfig *cfg)
++{
++    FILE *fp;
++    char line[4096];
++
++    PORT_Memset(cfg, 0, sizeof(*cfg));
++
++    fp = fopen(path, "r");
++    if (!fp) {
++        return PR_FALSE;
++    }
++
++    while (fgets(line, sizeof(line), fp)) {
++        char *key;
++        char *value;
++        char *sep;
++
++        key = ssl3_Ja4Trim(line);
++        if (!*key || *key == '#') {
++            continue;
++        }
++
++        sep = strchr(key, '=');
++        if (!sep) {
++            continue;
++        }
++        *sep = '\0';
++
++        key = ssl3_Ja4Trim(key);
++        value = ssl3_Ja4Trim(sep + 1);
++        if (!ssl3_Ja4ParseConfigEntry(cfg, key, value)) {
++            fclose(fp);
++            return PR_FALSE;
++        }
++    }
++
++    fclose(fp);
++    return ssl3_Ja4ValidateConfig(cfg);
++}
++
++static void
++ssl3_Ja4ApplyCipherOrderReorder(sslSocket *ss, const ssl3Ja4SlimConfig *cfg)
++{
++    ssl3CipherSuiteCfg reordered[ssl_V3_SUITES_IMPLEMENTED];
++    PRBool used[ssl_V3_SUITES_IMPLEMENTED];
++    unsigned int i;
++    unsigned int j;
++    unsigned int out = 0;
++
++    if (!cfg->hasCipherSuites || cfg->cipherSuiteCount == 0) {
++        return;
++    }
++
++    PORT_Memset(used, 0, sizeof(used));
++
++    for (i = 0; i < cfg->cipherSuiteCount; ++i) {
++        for (j = 0; j < ssl_V3_SUITES_IMPLEMENTED; ++j) {
++            if (!used[j] &&
++                ss->cipherSuites[j].cipher_suite == cfg->cipherSuites[i]) {
++                reordered[out++] = ss->cipherSuites[j];
++                used[j] = PR_TRUE;
++                break;
++            }
++        }
++    }
++
++    for (j = 0; j < ssl_V3_SUITES_IMPLEMENTED; ++j) {
++        if (!used[j]) {
++            reordered[out++] = ss->cipherSuites[j];
++        }
++    }
++
++    if (out == ssl_V3_SUITES_IMPLEMENTED) {
++        PORT_Memcpy(ss->cipherSuites, reordered, sizeof(reordered));
++    }
++}
++
++static void
++ssl3_Ja4ApplyCipherOrderExact(sslSocket *ss, const ssl3Ja4SlimConfig *cfg)
++{
++    ssl3CipherSuiteCfg reordered[ssl_V3_SUITES_IMPLEMENTED];
++    PRBool used[ssl_V3_SUITES_IMPLEMENTED];
++    unsigned int i;
++    unsigned int j;
++    unsigned int out = 0;
++
++    if (!cfg->hasCipherSuites || cfg->cipherSuiteCount == 0) {
++        return;
++    }
++
++    PORT_Memset(used, 0, sizeof(used));
++
++    for (i = 0; i < cfg->cipherSuiteCount; ++i) {
++        for (j = 0; j < ssl_V3_SUITES_IMPLEMENTED; ++j) {
++            if (!used[j] &&
++                ss->cipherSuites[j].cipher_suite == cfg->cipherSuites[i]) {
++                reordered[out++] = ss->cipherSuites[j];
++                reordered[out - 1].enabled = 1;
++                /* Exact replay is expected to resurrect explicitly requested
++                 * suites even when NSS policy initialization disabled them by
++                 * default. Keep this scoped to the JA4 exact-mode path rather
++                 * than mutating global policy. */
++                reordered[out - 1].policy = SSL_ALLOWED;
++                used[j] = PR_TRUE;
++                break;
++            }
++        }
++    }
++
++    for (j = 0; j < ssl_V3_SUITES_IMPLEMENTED; ++j) {
++        if (!used[j]) {
++            reordered[out++] = ss->cipherSuites[j];
++            reordered[out - 1].enabled = 0;
++        }
++    }
++
++    if (out == ssl_V3_SUITES_IMPLEMENTED) {
++        PORT_Memcpy(ss->cipherSuites, reordered, sizeof(reordered));
++    }
++}
++
++static PRBool
++ssl3_Ja4CollectEffectiveCipherSuites(sslSocket *ss, PRUint16 *out,
++                                     unsigned int maxCount,
++                                     unsigned int *outCount)
++{
++    unsigned int i;
++
++    *outCount = 0;
++    for (i = 0; i < ssl_V3_SUITES_IMPLEMENTED; ++i) {
++        ssl3CipherSuiteCfg *suite = &ss->cipherSuites[i];
++        if (!ssl3_config_match(suite, ss->ssl3.policy, &ss->vrange, ss)) {
++            continue;
++        }
++        if (*outCount >= maxCount) {
++            return PR_FALSE;
++        }
++        out[(*outCount)++] = suite->cipher_suite;
++    }
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4CollectEffectiveExtensionTypes(const sslBuffer *extensionBuf, PRUint16 *out,
++                                       unsigned int maxCount,
++                                       unsigned int *outCount)
++{
++    ssl3Ja4ExtensionView parsed[SSL3_JA4_CFG_MAX_LIST];
++    unsigned int parsedCount = 0;
++    unsigned int i;
++
++    if (!ssl3_Ja4ParseExtensionBuffer(extensionBuf, parsed, PR_ARRAY_SIZE(parsed),
++                                      &parsedCount)) {
++        return PR_FALSE;
++    }
++    if (parsedCount > maxCount) {
++        return PR_FALSE;
++    }
++
++    for (i = 0; i < parsedCount; ++i) {
++        out[i] = parsed[i].type;
++    }
++    *outCount = parsedCount;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4CompareU16Lists(const PRUint16 *left, unsigned int leftCount,
++                        const PRUint16 *right, unsigned int rightCount)
++{
++    unsigned int i;
++
++    if (leftCount != rightCount) {
++        return PR_FALSE;
++    }
++    for (i = 0; i < leftCount; ++i) {
++        if (left[i] != right[i]) {
++            return PR_FALSE;
++        }
++    }
++    return PR_TRUE;
++}
++
++static void
++ssl3_Ja4DumpU16List(FILE *fp, const PRUint16 *values, unsigned int count)
++{
++    unsigned int i;
++
++    for (i = 0; i < count; ++i) {
++        if (i) {
++            fputc(',', fp);
++        }
++        fprintf(fp, "%u", (unsigned int)values[i]);
++    }
++}
++
++static void
++ssl3_Ja4DumpRequestedCipherState(FILE *fp, const sslSocket *ss,
++                                 const ssl3Ja4SlimConfig *cfg)
++{
++    unsigned int i;
++
++    if (!cfg || !cfg->hasCipherSuites) {
++        return;
++    }
++
++    for (i = 0; i < cfg->cipherSuiteCount; ++i) {
++        const ssl3CipherSuiteCfg *suite =
++            ssl_LookupCipherSuiteCfg(cfg->cipherSuites[i], ss->cipherSuites);
++        if (!suite) {
++            fprintf(fp, "lib_cipher_state_%u=missing\n",
++                    (unsigned int)cfg->cipherSuites[i]);
++            continue;
++        }
++        fprintf(fp, "lib_cipher_state_%u=enabled:%u,policy:%u,present:%u\n",
++                (unsigned int)cfg->cipherSuites[i],
++                suite->enabled ? 1u : 0u,
++                (unsigned int)suite->policy,
++                suite->isPresent ? 1u : 0u);
++    }
++}
++
++static PRBool
++ssl3_Ja4ParseExtensionBuffer(const sslBuffer *extensionBuf,
++                             ssl3Ja4ExtensionView *out,
++                             unsigned int maxCount,
++                             unsigned int *outCount)
++{
++    unsigned int offset = 0;
++    unsigned int count = 0;
++
++    *outCount = 0;
++
++    while (offset < extensionBuf->len) {
++        unsigned int dataLen;
++        unsigned int totalLen;
++
++        if ((offset + 4) > extensionBuf->len || count >= maxCount) {
++            return PR_FALSE;
++        }
++
++        dataLen = (((unsigned int)extensionBuf->buf[offset + 2]) << 8) |
++                  (unsigned int)extensionBuf->buf[offset + 3];
++        totalLen = 4 + dataLen;
++        if ((offset + totalLen) > extensionBuf->len) {
++            return PR_FALSE;
++        }
++
++        out[count].type = (((PRUint16)extensionBuf->buf[offset]) << 8) |
++                          (PRUint16)extensionBuf->buf[offset + 1];
++        out[count].offset = offset;
++        out[count].length = totalLen;
++        ++count;
++        offset += totalLen;
++    }
++
++    *outCount = count;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4FindExtension(const sslBuffer *extensionBuf, PRUint16 type,
++                      ssl3Ja4ExtensionView *view)
++{
++    ssl3Ja4ExtensionView parsed[SSL3_JA4_CFG_MAX_LIST];
++    unsigned int parsedCount = 0;
++    unsigned int i;
++
++    if (!ssl3_Ja4ParseExtensionBuffer(extensionBuf, parsed, PR_ARRAY_SIZE(parsed),
++                                      &parsedCount)) {
++        return PR_FALSE;
++    }
++
++    for (i = 0; i < parsedCount; ++i) {
++        if (parsed[i].type == type) {
++            *view = parsed[i];
++            return PR_TRUE;
++        }
++    }
++
++    return PR_FALSE;
++}
++
++static SECStatus
++ssl3_Ja4ReplaceExtensionBody(sslBuffer *extensionBuf, PRUint16 type,
++                             const PRUint8 *body, unsigned int bodyLen)
++{
++    ssl3Ja4ExtensionView parsed[SSL3_JA4_CFG_MAX_LIST];
++    sslBuffer rewritten = SSL_BUFFER_EMPTY;
++    unsigned int parsedCount = 0;
++    unsigned int i;
++    PRBool replaced = PR_FALSE;
++
++    if (!ssl3_Ja4ParseExtensionBuffer(extensionBuf, parsed, PR_ARRAY_SIZE(parsed),
++                                      &parsedCount)) {
++        return SECFailure;
++    }
++
++    for (i = 0; i < parsedCount; ++i) {
++        if (parsed[i].type == type) {
++            if (sslBuffer_AppendNumber(&rewritten, type, 2) != SECSuccess ||
++                sslBuffer_AppendNumber(&rewritten, bodyLen, 2) != SECSuccess ||
++                sslBuffer_Append(&rewritten, body, bodyLen) != SECSuccess) {
++                goto loser;
++            }
++            replaced = PR_TRUE;
++            continue;
++        }
++
++        if (sslBuffer_Append(&rewritten, extensionBuf->buf + parsed[i].offset,
++                             parsed[i].length) != SECSuccess) {
++            goto loser;
++        }
++    }
++
++    if (!replaced) {
++        goto loser;
++    }
++
++    sslBuffer_Clear(extensionBuf);
++    *extensionBuf = rewritten;
++    return SECSuccess;
++
++loser:
++    sslBuffer_Clear(&rewritten);
++    return SECFailure;
++}
++
++static PRBool
++ssl3_Ja4ConsumeU16List(const PRUint8 *data, unsigned int dataLen,
++                       unsigned int headerLen, PRUint16 *out,
++                       unsigned int maxCount, unsigned int *outCount)
++{
++    unsigned int payloadLen = 0;
++    unsigned int offset = 0;
++
++    *outCount = 0;
++
++    if (headerLen == 1) {
++        if (dataLen < 1) {
++            return PR_FALSE;
++        }
++        payloadLen = data[0];
++        offset = 1;
++    } else if (headerLen == 2) {
++        if (dataLen < 2) {
++            return PR_FALSE;
++        }
++        payloadLen = (((unsigned int)data[0]) << 8) | data[1];
++        offset = 2;
++    } else {
++        return PR_FALSE;
++    }
++
++    if (payloadLen + offset != dataLen || (payloadLen & 1)) {
++        return PR_FALSE;
++    }
++
++    while (offset < dataLen) {
++        if (*outCount >= maxCount) {
++            return PR_FALSE;
++        }
++        out[(*outCount)++] = (((PRUint16)data[offset]) << 8) | data[offset + 1];
++        offset += 2;
++    }
++
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4CollectSupportedVersions(const sslBuffer *extensionBuf, PRUint16 *out,
++                                 unsigned int maxCount, unsigned int *outCount)
++{
++    ssl3Ja4ExtensionView view;
++
++    if (!ssl3_Ja4FindExtension(extensionBuf, ssl_tls13_supported_versions_xtn,
++                               &view) ||
++        view.length < 5) {
++        return PR_FALSE;
++    }
++
++    return ssl3_Ja4ConsumeU16List(extensionBuf->buf + view.offset + 4,
++                                  view.length - 4, 1,
++                                  out, maxCount, outCount);
++}
++
++static PRBool
++ssl3_Ja4CollectSupportedGroups(const sslBuffer *extensionBuf, PRUint16 *out,
++                               unsigned int maxCount, unsigned int *outCount)
++{
++    ssl3Ja4ExtensionView view;
++
++    if (!ssl3_Ja4FindExtension(extensionBuf, ssl_supported_groups_xtn, &view) ||
++        view.length < 6) {
++        return PR_FALSE;
++    }
++
++    return ssl3_Ja4ConsumeU16List(extensionBuf->buf + view.offset + 4,
++                                  view.length - 4, 2,
++                                  out, maxCount, outCount);
++}
++
++static PRBool
++ssl3_Ja4CollectPskKeyExchangeModes(const sslBuffer *extensionBuf, PRUint8 *out,
++                                   unsigned int maxCount, unsigned int *outCount)
++{
++    ssl3Ja4ExtensionView view;
++    const PRUint8 *data;
++    unsigned int i;
++    unsigned int payloadLen;
++
++    *outCount = 0;
++
++    if (!ssl3_Ja4FindExtension(extensionBuf, ssl_tls13_psk_key_exchange_modes_xtn,
++                               &view) ||
++        view.length < 5) {
++        return PR_FALSE;
++    }
++
++    data = extensionBuf->buf + view.offset + 4;
++    payloadLen = data[0];
++    if (payloadLen + 1 != view.length - 4 || payloadLen > maxCount) {
++        return PR_FALSE;
++    }
++
++    for (i = 0; i < payloadLen; ++i) {
++        out[i] = data[i + 1];
++    }
++    *outCount = payloadLen;
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4CollectKeyShareGroups(const sslBuffer *extensionBuf, PRUint16 *out,
++                              unsigned int maxCount, unsigned int *outCount)
++{
++    ssl3Ja4ExtensionView view;
++    const PRUint8 *data;
++    unsigned int dataLen;
++    unsigned int payloadLen;
++    unsigned int offset;
++
++    *outCount = 0;
++
++    if (!ssl3_Ja4FindExtension(extensionBuf, ssl_tls13_key_share_xtn, &view) ||
++        view.length < 6) {
++        return PR_FALSE;
++    }
++
++    data = extensionBuf->buf + view.offset + 4;
++    dataLen = view.length - 4;
++    payloadLen = (((unsigned int)data[0]) << 8) | data[1];
++    if (payloadLen + 2 != dataLen) {
++        return PR_FALSE;
++    }
++
++    offset = 2;
++    while (offset < dataLen) {
++        unsigned int shareLen;
++        if ((offset + 4) > dataLen || *outCount >= maxCount) {
++            return PR_FALSE;
++        }
++        out[(*outCount)++] = (((PRUint16)data[offset]) << 8) | data[offset + 1];
++        shareLen = (((unsigned int)data[offset + 2]) << 8) | data[offset + 3];
++        offset += 4;
++        if ((offset + shareLen) > dataLen) {
++            return PR_FALSE;
++        }
++        offset += shareLen;
++    }
++
++    return PR_TRUE;
++}
++
++static PRBool
++ssl3_Ja4CompareU8Lists(const PRUint8 *left, unsigned int leftCount,
++                       const PRUint8 *right, unsigned int rightCount)
++{
++    unsigned int i;
++
++    if (leftCount != rightCount) {
++        return PR_FALSE;
++    }
++    for (i = 0; i < leftCount; ++i) {
++        if (left[i] != right[i]) {
++            return PR_FALSE;
++        }
++    }
++    return PR_TRUE;
++}
++
++static void
++ssl3_Ja4DumpU8List(FILE *fp, const PRUint8 *values, unsigned int count)
++{
++    unsigned int i;
++
++    for (i = 0; i < count; ++i) {
++        if (i) {
++            fputc(',', fp);
++        }
++        fprintf(fp, "%u", (unsigned int)values[i]);
++    }
++}
++
++static void
++ssl3_Ja4SyncXtnDataFromBuffer(sslSocket *ss, const sslBuffer *extensionBuf)
++{
++    ssl3Ja4ExtensionView parsed[SSL3_JA4_CFG_MAX_LIST];
++    unsigned int parsedCount = 0;
++    unsigned int i;
++
++    ss->xtnData.numAdvertised = 0;
++    ss->xtnData.lastXtnOffset = 0;
++    ss->xtnData.echXtnOffset = 0;
++
++    if (!ssl3_Ja4ParseExtensionBuffer(extensionBuf, parsed, PR_ARRAY_SIZE(parsed),
++                                      &parsedCount)) {
++        return;
++    }
++
++    for (i = 0; i < parsedCount; ++i) {
++        ss->xtnData.advertised[ss->xtnData.numAdvertised++] = parsed[i].type;
++        if (parsed[i].type == ssl_tls13_pre_shared_key_xtn) {
++            ss->xtnData.lastXtnOffset = parsed[i].offset;
++        }
++        if (parsed[i].type == ssl_tls13_encrypted_client_hello_xtn) {
++            ss->xtnData.echXtnOffset = parsed[i].offset;
++        }
++    }
++}
++
++static SECStatus
++ssl3_Ja4BuildSupportedVersionsBody(const sslSocket *ss,
++                                   const ssl3Ja4SlimConfig *cfg,
++                                   sslBuffer *body)
++{
++    unsigned int i;
++
++    if (sslBuffer_AppendNumber(body, cfg->supportedVersionCount * 2, 1) !=
++        SECSuccess) {
++        return SECFailure;
++    }
++
++    for (i = 0; i < cfg->supportedVersionCount; ++i) {
++        PRUint16 wire = tls13_EncodeVersion(cfg->supportedVersions[i],
++                                            ss->protocolVariant);
++        if (sslBuffer_AppendNumber(body, wire, 2) != SECSuccess) {
++            return SECFailure;
++        }
++    }
++
++    return SECSuccess;
++}
++
++static SECStatus
++ssl3_Ja4BuildSupportedGroupsBody(const ssl3Ja4SlimConfig *cfg, sslBuffer *body)
++{
++    unsigned int i;
++
++    if (sslBuffer_AppendNumber(body, cfg->supportedGroupCount * 2, 2) !=
++        SECSuccess) {
++        return SECFailure;
++    }
++
++    for (i = 0; i < cfg->supportedGroupCount; ++i) {
++        if (sslBuffer_AppendNumber(body, cfg->supportedGroups[i], 2) !=
++            SECSuccess) {
++            return SECFailure;
++        }
++    }
++
++    return SECSuccess;
++}
++
++static SECStatus
++ssl3_Ja4BuildPskModesBody(const ssl3Ja4SlimConfig *cfg, sslBuffer *body)
++{
++    if (sslBuffer_AppendNumber(body, cfg->pskKeyExchangeModeCount, 1) !=
++        SECSuccess) {
++        return SECFailure;
++    }
++    if (sslBuffer_Append(body, cfg->pskKeyExchangeModes,
++                         cfg->pskKeyExchangeModeCount) != SECSuccess) {
++        return SECFailure;
++    }
++    return SECSuccess;
++}
++
++static sslEphemeralKeyPair *
++ssl3_Ja4FindEphemeralKeyPair(sslSocket *ss, PRUint16 group)
++{
++    PRCList *cursor;
++
++    for (cursor = PR_NEXT_LINK(&ss->ephemeralKeyPairs);
++         cursor != &ss->ephemeralKeyPairs;
++         cursor = PR_NEXT_LINK(cursor)) {
++        sslEphemeralKeyPair *keyPair = (sslEphemeralKeyPair *)cursor;
++        if (keyPair->group && keyPair->group->name == group) {
++            return keyPair;
++        }
++    }
++
++    return NULL;
++}
++
++static SECStatus
++ssl3_Ja4BuildKeyShareBody(sslSocket *ss, const ssl3Ja4SlimConfig *cfg,
++                          sslBuffer *body)
++{
++    sslBuffer entries = SSL_BUFFER_EMPTY;
++    unsigned int i;
++
++    for (i = 0; i < cfg->keyShareGroupCount; ++i) {
++        sslEphemeralKeyPair *keyPair =
++            ssl3_Ja4FindEphemeralKeyPair(ss, cfg->keyShareGroups[i]);
++        if (!keyPair) {
++            goto loser;
++        }
++        if (tls13_EncodeKeyShareEntry(&entries, keyPair) != SECSuccess) {
++            goto loser;
++        }
++    }
++
++    if (sslBuffer_AppendNumber(body, entries.len, 2) != SECSuccess ||
++        sslBuffer_AppendBuffer(body, &entries) != SECSuccess) {
++        goto loser;
++    }
++
++    sslBuffer_Clear(&entries);
++    return SECSuccess;
++
++loser:
++    sslBuffer_Clear(&entries);
++    return SECFailure;
++}
++
++static SECStatus
++ssl3_Ja4RewriteTls13ExtensionBodies(sslSocket *ss,
++                                    const ssl3Ja4SlimConfig *cfg,
++                                    sslBuffer *extensionBuf)
++{
++    sslBuffer body = SSL_BUFFER_EMPTY;
++
++    if (cfg->hasSupportedVersions) {
++        if (ssl3_Ja4BuildSupportedVersionsBody(ss, cfg, &body) != SECSuccess ||
++            ssl3_Ja4ReplaceExtensionBody(extensionBuf,
++                                         ssl_tls13_supported_versions_xtn,
++                                         body.buf, body.len) != SECSuccess) {
++            goto loser;
++        }
++        sslBuffer_Clear(&body);
++    }
++
++    if (cfg->hasSupportedGroups) {
++        if (ssl3_Ja4BuildSupportedGroupsBody(cfg, &body) != SECSuccess ||
++            ssl3_Ja4ReplaceExtensionBody(extensionBuf, ssl_supported_groups_xtn,
++                                         body.buf, body.len) != SECSuccess) {
++            goto loser;
++        }
++        sslBuffer_Clear(&body);
++    }
++
++    if (cfg->hasPskKeyExchangeModes) {
++        if (ssl3_Ja4BuildPskModesBody(cfg, &body) != SECSuccess ||
++            ssl3_Ja4ReplaceExtensionBody(extensionBuf,
++                                         ssl_tls13_psk_key_exchange_modes_xtn,
++                                         body.buf, body.len) != SECSuccess) {
++            goto loser;
++        }
++        sslBuffer_Clear(&body);
++    }
++
++    if (cfg->hasKeyShareGroups) {
++        if (ssl3_Ja4BuildKeyShareBody(ss, cfg, &body) != SECSuccess ||
++            ssl3_Ja4ReplaceExtensionBody(extensionBuf, ssl_tls13_key_share_xtn,
++                                         body.buf, body.len) != SECSuccess) {
++            goto loser;
++        }
++        sslBuffer_Clear(&body);
++    }
++
++    return SECSuccess;
++
++loser:
++    sslBuffer_Clear(&body);
++    return SECFailure;
++}
++
++static SECStatus
++ssl3_Ja4RewriteClientExtensions(sslSocket *ss, const ssl3Ja4SlimConfig *cfg,
++                                sslBuffer *extensionBuf)
++{
++    ssl3Ja4ExtensionView parsed[SSL3_JA4_CFG_MAX_LIST];
++    PRBool used[SSL3_JA4_CFG_MAX_LIST];
++    sslBuffer rewritten = SSL_BUFFER_EMPTY;
++    unsigned int parsedCount = 0;
++    unsigned int i;
++    unsigned int j;
++    PRBool hasSniInOutput = PR_FALSE;
++
++    if (!cfg->hasExtensionOrder && !cfg->hasSniMode) {
++        return SECSuccess;
++    }
++
++    if (!ssl3_Ja4ParseExtensionBuffer(extensionBuf, parsed, PR_ARRAY_SIZE(parsed),
++                                      &parsedCount)) {
++        return SECFailure;
++    }
++    PORT_Memset(used, 0, sizeof(used));
++
++    if (cfg->hasExtensionOrder) {
++        for (i = 0; i < cfg->extensionCount; ++i) {
++            PRBool found = PR_FALSE;
++            for (j = 0; j < parsedCount; ++j) {
++                if (used[j] || parsed[j].type != cfg->extensions[i]) {
++                    continue;
++                }
++                used[j] = PR_TRUE;
++                found = PR_TRUE;
++                if (cfg->hasSniMode && !cfg->sniPresent &&
++                    parsed[j].type == ssl_server_name_xtn) {
++                    break;
++                }
++                if (sslBuffer_Append(&rewritten,
++                                     extensionBuf->buf + parsed[j].offset,
++                                     parsed[j].length) != SECSuccess) {
++                    goto loser;
++                }
++                if (parsed[j].type == ssl_server_name_xtn) {
++                    hasSniInOutput = PR_TRUE;
++                }
++                break;
++            }
++            /* JA4 EXACT-mode synthetic stub: the user listed an extension
++             * type that NSS' clientHelloSendersTLS[] dispatcher did not
++             * produce. Write a length-0 body so the JA4_c hash sees the
++             * type appear in the right position. TLS 1.3 servers must
++             * ignore unknown ClientHello extensions (RFC 8446 4.2); TLS
++             * 1.2 ignores unknown client extensions silently. If a buggy
++             * server echoes one back, ssl3_HandleUnknownExtension drops
++             * it. SNI is exempt — its body is mandatory and would never
++             * be a synthetic candidate (NSS always produces it when
++             * needed). */
++            if (!found && ssl3_Ja4UseExtensionModeExact(cfg) &&
++                cfg->extensions[i] != ssl_server_name_xtn) {
++                if (sslBuffer_AppendNumber(&rewritten, cfg->extensions[i],
++                                           2) != SECSuccess ||
++                    sslBuffer_AppendNumber(&rewritten, 0, 2) != SECSuccess) {
++                    goto loser;
++                }
++            }
++        }
++
++        if (ssl3_Ja4UseExtensionModeReorder(cfg)) {
++            for (j = 0; j < parsedCount; ++j) {
++                if (used[j]) {
++                    continue;
++                }
++                if (cfg->hasSniMode && !cfg->sniPresent &&
++                    parsed[j].type == ssl_server_name_xtn) {
++                    continue;
++                }
++                if (sslBuffer_Append(&rewritten,
++                                     extensionBuf->buf + parsed[j].offset,
++                                     parsed[j].length) != SECSuccess) {
++                    goto loser;
++                }
++                if (parsed[j].type == ssl_server_name_xtn) {
++                    hasSniInOutput = PR_TRUE;
++                }
++            }
++        }
++
++        if (cfg->hasSniMode && cfg->sniPresent && !hasSniInOutput) {
++            for (j = 0; j < parsedCount; ++j) {
++                if (used[j] || parsed[j].type != ssl_server_name_xtn) {
++                    continue;
++                }
++                if (sslBuffer_Append(&rewritten,
++                                     extensionBuf->buf + parsed[j].offset,
++                                     parsed[j].length) != SECSuccess) {
++                    goto loser;
++                }
++                hasSniInOutput = PR_TRUE;
++                break;
++            }
++        }
++    } else {
++        for (j = 0; j < parsedCount; ++j) {
++            if (cfg->hasSniMode && !cfg->sniPresent &&
++                parsed[j].type == ssl_server_name_xtn) {
++                continue;
++            }
++            if (sslBuffer_Append(&rewritten,
++                                 extensionBuf->buf + parsed[j].offset,
++                                 parsed[j].length) != SECSuccess) {
++                goto loser;
++            }
++        }
++    }
++
++    sslBuffer_Clear(extensionBuf);
++    *extensionBuf = rewritten;
++    ssl3_Ja4SyncXtnDataFromBuffer(ss, extensionBuf);
++    return SECSuccess;
++
++loser:
++    sslBuffer_Clear(&rewritten);
++    return SECFailure;
++}
++
++static SECStatus
++ssl3_Ja4EnsurePskExtensionLast(sslBuffer *extensionBuf)
++{
++    ssl3Ja4ExtensionView view;
++    sslBuffer rewritten = SSL_BUFFER_EMPTY;
++    unsigned int tailOffset;
++    unsigned int tailLen;
++
++    if (!ssl3_Ja4FindExtension(extensionBuf, ssl_tls13_pre_shared_key_xtn,
++                               &view)) {
++        return SECSuccess;
++    }
++
++    tailOffset = view.offset + view.length;
++    if (tailOffset == extensionBuf->len) {
++        return SECSuccess;
++    }
++
++    tailLen = extensionBuf->len - tailOffset;
++    if (view.offset &&
++        sslBuffer_Append(&rewritten, extensionBuf->buf, view.offset) !=
++            SECSuccess) {
++        goto loser;
++    }
++    if (tailLen &&
++        sslBuffer_Append(&rewritten, extensionBuf->buf + tailOffset, tailLen) !=
++            SECSuccess) {
++        goto loser;
++    }
++    if (sslBuffer_Append(&rewritten, extensionBuf->buf + view.offset,
++                         view.length) != SECSuccess) {
++        goto loser;
++    }
++
++    sslBuffer_Clear(extensionBuf);
++    *extensionBuf = rewritten;
++    return SECSuccess;
++
++loser:
++    sslBuffer_Clear(&rewritten);
++    return SECFailure;
++}
++
++static SECStatus
++ssl3_Ja4FinalizeClientExtensions(sslSocket *ss,
++                                 const ssl3Ja4SlimConfig *cfg,
++                                 sslBuffer *extensionBuf)
++{
++    if (cfg->hasExtensionOrder || cfg->hasSniMode) {
++        if (ssl3_Ja4RewriteClientExtensions(ss, cfg, extensionBuf) !=
++            SECSuccess) {
++            return SECFailure;
++        }
++    }
++
++    if (ssl3_Ja4EnsurePskExtensionLast(extensionBuf) != SECSuccess) {
++        return SECFailure;
++    }
++
++    ssl3_Ja4SyncXtnDataFromBuffer(ss, extensionBuf);
++    return SECSuccess;
++}
++
++static void
++ssl3_Ja4ApplySocketConfig(sslSocket *ss, const ssl3Ja4SlimConfig *cfg)
++{
++    PRUint16 minVersion;
++    PRUint16 maxVersion;
++    SECItem *item;
++    unsigned int i;
++
++    if (cfg->hasCipherSuites) {
++        if (cfg->hasCipherMode && cfg->cipherMode == ssl3Ja4CipherModeExact) {
++            ssl3_Ja4ApplyCipherOrderExact(ss, cfg);
++        } else {
++            ssl3_Ja4ApplyCipherOrderReorder(ss, cfg);
++        }
++    }
++
++    if (cfg->hasSignatureSchemes) {
++        ss->ssl3.signatureSchemeCount = cfg->signatureSchemeCount;
++        PORT_Memcpy(ss->ssl3.signatureSchemes, cfg->signatureSchemes,
++                    cfg->signatureSchemeCount * sizeof(cfg->signatureSchemes[0]));
++    }
++
++    if (cfg->hasAlpn) {
++        SECITEM_FreeItem(&ss->opt.nextProtoNego, PR_FALSE);
++        ss->opt.enableALPN = PR_FALSE;
++
++        if (cfg->alpnLen) {
++            item = SECITEM_AllocItem(NULL, &ss->opt.nextProtoNego, cfg->alpnLen);
++            if (item && item->data) {
++                PORT_Memcpy(ss->opt.nextProtoNego.data, cfg->alpn, cfg->alpnLen);
++                ss->opt.enableALPN = PR_TRUE;
++            }
++        }
++    }
++
++    if (cfg->hasEnableGrease) {
++        ss->opt.enableGrease = cfg->enableGrease;
++    }
++    if (cfg->hasEnableChXtnPermutation) {
++        ss->opt.enableChXtnPermutation = cfg->enableChXtnPermutation;
++    }
++
++    minVersion = cfg->hasTlsMin ? cfg->tlsMin : ss->vrange.min;
++    maxVersion = cfg->hasTlsMax ? cfg->tlsMax : ss->vrange.max;
++    if (minVersion <= maxVersion) {
++        ss->vrange.min = minVersion;
++        ss->vrange.max = maxVersion;
++    }
++
++    if (cfg->hasSupportedGroups || cfg->hasKeyShareGroups) {
++        unsigned int prefCount = 0;
++        unsigned int sourceCount = cfg->hasSupportedGroups ? cfg->supportedGroupCount
++                                                           : cfg->keyShareGroupCount;
++        const PRUint16 *source = cfg->hasSupportedGroups ? cfg->supportedGroups
++                                                         : cfg->keyShareGroups;
++
++        for (i = 0; i < SSL_NAMED_GROUP_COUNT; ++i) {
++            ss->namedGroupPreferences[i] = NULL;
++        }
++
++        for (i = 0; i < sourceCount && prefCount < SSL_NAMED_GROUP_COUNT; ++i) {
++            const sslNamedGroupDef *group =
++                ssl_LookupNamedGroup((SSLNamedGroup)source[i]);
++            if (!group) {
++                continue;
++            }
++            ss->namedGroupPreferences[prefCount++] = group;
++        }
++
++        ss->additionalShares = cfg->hasKeyShareGroups && prefCount
++                                   ? (prefCount - 1)
++                                   : 0;
++    }
++}
++
++/* Replace the random GREASE values that NSS produced in
++ * tls13_ClientGreaseSetup() with the deterministic value derived from
++ * cfg->greaseValue (analogous to BoringSSL's ssl_get_grease_value). The
++ * derivation matches NSS' own slot encoding: slot = (greaseValue & 0xf0) | 0x0a
++ * and ((slot << 8) | slot) is written into every slot. NSS still requires the
++ * two ClientHello GREASE extension slots to differ, so we keep the existing
++ * disambiguation (XOR 0x1010). */
++static void
++ssl3_Ja4MaybeOverrideGrease(sslSocket *ss, const ssl3Ja4SlimConfig *cfg)
++{
++    PRUint8 nibble;
++    PRUint16 slot;
++    size_t i;
++
++    if (!cfg || !cfg->greaseValueSet) {
++        return;
++    }
++    if (!ss->opt.enableGrease || !ss->ssl3.hs.grease) {
++        return;
++    }
++
++    nibble = (PRUint8)(((cfg->greaseValue & 0xf0u) | 0x0au) & 0xffu);
++    slot = (PRUint16)(((PRUint16)nibble << 8) | nibble);
++
++    for (i = 0; i < PR_ARRAY_SIZE(ss->ssl3.hs.grease->idx); ++i) {
++        ss->ssl3.hs.grease->idx[i] = slot;
++    }
++    if (ss->ssl3.hs.grease->idx[grease_extension1] ==
++        ss->ssl3.hs.grease->idx[grease_extension2]) {
++        ss->ssl3.hs.grease->idx[grease_extension2] ^= 0x1010;
++    }
++    ss->ssl3.hs.grease->pskKem = (PRUint8)(0x0b + ((nibble >> 5) * 0x1f));
++}
++
++static PRBool
++ssl3_Ja4LoadConfigFromEnv(ssl3Ja4SlimConfig *cfg)
++{
++    const char *path = getenv("NSS_JA4_CONFIG");
++    if (!path || !*path) {
++        return PR_FALSE;
++    }
++    return ssl3_Ja4LoadConfig(path, cfg);
++}
++
++/* JA4 cfg active for the in-flight ClientHello. Set by ssl3_SendClientHello
++ * after env-load, cleared on exit. Read by ssl3_AppendCipherSuites (and W2
++ * synthetic-extension injection) to bypass NSS' table-bound emission for
++ * EXACT-mode raw lying. The pointer references caller-owned stack memory
++ * inside ssl3_SendClientHello — valid for the only callsite that reads it. */
++static const ssl3Ja4SlimConfig *s_ja4ActiveConfig = NULL;
++
++static void
++ssl3_Ja4SetActiveConfig(const ssl3Ja4SlimConfig *cfg)
++{
++    s_ja4ActiveConfig = cfg;
++}
++
++static const ssl3Ja4SlimConfig *
++ssl3_Ja4GetActiveConfig(void)
++{
++    return s_ja4ActiveConfig;
++}
++
++static PRUint32
++ssl3_Ja4CollectMismatchMask(sslSocket *ss, const ssl3Ja4SlimConfig *cfg,
++                            const sslBuffer *extensionBuf)
++{
++    PRUint16 effectiveCiphers[ssl_V3_SUITES_IMPLEMENTED];
++    PRUint16 effectiveExtensions[SSL3_JA4_CFG_MAX_LIST];
++    PRUint16 effectiveSupportedVersions[SSL3_JA4_CFG_MAX_LIST];
++    PRUint16 effectiveSupportedGroups[SSL3_JA4_CFG_MAX_LIST];
++    PRUint16 effectiveKeyShareGroups[SSL3_JA4_CFG_MAX_LIST];
++    PRUint8 effectivePskModes[SSL3_JA4_CFG_MAX_LIST];
++    unsigned int effectiveCipherCount = 0;
++    unsigned int effectiveExtensionCount = 0;
++    unsigned int effectiveSupportedVersionCount = 0;
++    unsigned int effectiveSupportedGroupCount = 0;
++    unsigned int effectiveKeyShareGroupCount = 0;
++    unsigned int effectivePskModeCount = 0;
++    PRUint32 mismatchMask = 0;
++
++    if (cfg->hasCipherSuites &&
++        cfg->hasCipherMode &&
++        cfg->cipherMode == ssl3Ja4CipherModeExact &&
++        ssl3_Ja4CollectEffectiveCipherSuites(ss, effectiveCiphers,
++                                             PR_ARRAY_SIZE(effectiveCiphers),
++                                             &effectiveCipherCount)) {
++        if (!ssl3_Ja4CompareU16Lists((const PRUint16 *)cfg->cipherSuites,
++                                     cfg->cipherSuiteCount, effectiveCiphers,
++                                     effectiveCipherCount)) {
++            mismatchMask |= ssl3Ja4MismatchCipherSuites;
++        }
++    } else if (cfg->hasCipherSuites &&
++               cfg->hasCipherMode &&
++               cfg->cipherMode == ssl3Ja4CipherModeExact) {
++        mismatchMask |= ssl3Ja4MismatchCipherSuites;
++    }
++
++    if (cfg->hasAlpn) {
++        if ((cfg->alpnLen != ss->opt.nextProtoNego.len) ||
++            PORT_Memcmp(cfg->alpn, ss->opt.nextProtoNego.data, cfg->alpnLen)) {
++            mismatchMask |= ssl3Ja4MismatchAlpn;
++        }
++    }
++
++    if (cfg->hasSignatureSchemes) {
++        if (!ssl3_Ja4CompareU16Lists((const PRUint16 *)cfg->signatureSchemes,
++                                     cfg->signatureSchemeCount,
++                                     (const PRUint16 *)ss->ssl3.signatureSchemes,
++                                     ss->ssl3.signatureSchemeCount)) {
++            mismatchMask |= ssl3Ja4MismatchSignatureSchemes;
++        }
++    }
++
++    if (cfg->hasExtensionOrder &&
++        ssl3_Ja4UseExtensionModeExact(cfg) &&
++        ssl3_Ja4CollectEffectiveExtensionTypes(extensionBuf, effectiveExtensions,
++                                               PR_ARRAY_SIZE(effectiveExtensions),
++                                               &effectiveExtensionCount)) {
++        if (!ssl3_Ja4CompareU16Lists(cfg->extensions, cfg->extensionCount,
++                                     effectiveExtensions,
++                                     effectiveExtensionCount)) {
++            mismatchMask |= ssl3Ja4MismatchExtensions;
++        }
++    } else if (cfg->hasExtensionOrder &&
++               ssl3_Ja4UseExtensionModeExact(cfg)) {
++        mismatchMask |= ssl3Ja4MismatchExtensions;
++    }
++
++    /* Phase 2: any explicitly-requested or auto-injected extension id that
++     * does not show up in the final ClientHello sets the schema-defined
++     * MissingExtension bit. This complements the strict order-match check
++     * above (which fires on order/membership differences). */
++    if (cfg->hasExtensionOrder &&
++        ssl3_Ja4CollectEffectiveExtensionTypes(extensionBuf, effectiveExtensions,
++                                               PR_ARRAY_SIZE(effectiveExtensions),
++                                               &effectiveExtensionCount)) {
++        unsigned int ri;
++        for (ri = 0; ri < cfg->extensionCount; ++ri) {
++            unsigned int fi;
++            PRBool found = PR_FALSE;
++            for (fi = 0; fi < effectiveExtensionCount; ++fi) {
++                if (effectiveExtensions[fi] == cfg->extensions[ri]) {
++                    found = PR_TRUE;
++                    break;
++                }
++            }
++            if (!found) {
++                mismatchMask |= ssl3Ja4MismatchMissingExtension;
++                break;
++            }
++        }
++    } else if (cfg->hasExtensionOrder && cfg->extensionCount) {
++        mismatchMask |= ssl3Ja4MismatchMissingExtension;
++    }
++
++    if (cfg->hasSupportedVersions &&
++        ssl3_Ja4CollectSupportedVersions(extensionBuf, effectiveSupportedVersions,
++                                         PR_ARRAY_SIZE(effectiveSupportedVersions),
++                                         &effectiveSupportedVersionCount)) {
++        if (!ssl3_Ja4CompareU16Lists(cfg->supportedVersions,
++                                     cfg->supportedVersionCount,
++                                     effectiveSupportedVersions,
++                                     effectiveSupportedVersionCount)) {
++            mismatchMask |= ssl3Ja4MismatchSupportedVersions;
++        }
++    } else if (cfg->hasSupportedVersions) {
++        mismatchMask |= ssl3Ja4MismatchSupportedVersions;
++    }
++
++    if (cfg->hasSupportedGroups &&
++        ssl3_Ja4CollectSupportedGroups(extensionBuf, effectiveSupportedGroups,
++                                       PR_ARRAY_SIZE(effectiveSupportedGroups),
++                                       &effectiveSupportedGroupCount)) {
++        if (!ssl3_Ja4CompareU16Lists(cfg->supportedGroups,
++                                     cfg->supportedGroupCount,
++                                     effectiveSupportedGroups,
++                                     effectiveSupportedGroupCount)) {
++            mismatchMask |= ssl3Ja4MismatchSupportedGroups;
++        }
++    } else if (cfg->hasSupportedGroups) {
++        mismatchMask |= ssl3Ja4MismatchSupportedGroups;
++    }
++
++    if (cfg->hasKeyShareGroups &&
++        ssl3_Ja4CollectKeyShareGroups(extensionBuf, effectiveKeyShareGroups,
++                                      PR_ARRAY_SIZE(effectiveKeyShareGroups),
++                                      &effectiveKeyShareGroupCount)) {
++        if (!ssl3_Ja4CompareU16Lists(cfg->keyShareGroups,
++                                     cfg->keyShareGroupCount,
++                                     effectiveKeyShareGroups,
++                                     effectiveKeyShareGroupCount)) {
++            mismatchMask |= ssl3Ja4MismatchKeyShareGroups;
++        }
++    } else if (cfg->hasKeyShareGroups) {
++        mismatchMask |= ssl3Ja4MismatchKeyShareGroups;
++    }
++
++    if (cfg->hasPskKeyExchangeModes &&
++        ssl3_Ja4CollectPskKeyExchangeModes(extensionBuf, effectivePskModes,
++                                           PR_ARRAY_SIZE(effectivePskModes),
++                                           &effectivePskModeCount)) {
++        if (!ssl3_Ja4CompareU8Lists(cfg->pskKeyExchangeModes,
++                                    cfg->pskKeyExchangeModeCount,
++                                    effectivePskModes,
++                                    effectivePskModeCount)) {
++            mismatchMask |= ssl3Ja4MismatchPskKeyExchangeModes;
++        }
++    } else if (cfg->hasPskKeyExchangeModes) {
++        mismatchMask |= ssl3Ja4MismatchPskKeyExchangeModes;
++    }
++
++    return mismatchMask;
++}
++
++static SECStatus
++ssl3_Ja4EnforceStrictConfig(sslSocket *ss, const ssl3Ja4SlimConfig *cfg,
++                            const sslBuffer *extensionBuf,
++                            PRUint32 *mismatchMask)
++{
++    PRUint32 mask = ssl3_Ja4CollectMismatchMask(ss, cfg, extensionBuf);
++
++    if (mismatchMask) {
++        *mismatchMask = mask;
++    }
++
++    if (!cfg->strict) {
++        return SECSuccess;
++    }
++
++    if (mask) {
++        PORT_SetError(SEC_ERROR_INVALID_ARGS);
++        return SECFailure;
++    }
++
++    return SECSuccess;
++}
++
++static void
++ssl3_Ja4DumpAlpn(FILE *fp, const SECItem *alpn)
++{
++    unsigned int offset = 0;
++    PRBool first = PR_TRUE;
++
++    while (offset < alpn->len) {
++        unsigned int len = alpn->data[offset];
++        if (len == 0 || (offset + 1 + len) > alpn->len) {
++            break;
++        }
++        if (!first) {
++            fputc(',', fp);
++        }
++        fwrite(alpn->data + offset + 1, 1, len, fp);
++        first = PR_FALSE;
++        offset += 1 + len;
++    }
++}
++
++static void
++ssl3_Ja4MaybeDumpConfig(sslSocket *ss, const ssl3Ja4SlimConfig *cfg,
++                        PRUint32 mismatchMask,
++                        const sslBuffer *extensionBuf)
++{
++    ssl3Ja4ExtensionView parsed[SSL3_JA4_CFG_MAX_LIST];
++    PRUint16 effectiveCiphers[ssl_V3_SUITES_IMPLEMENTED];
++    PRUint16 effectiveSupportedVersions[SSL3_JA4_CFG_MAX_LIST];
++    PRUint16 effectiveSupportedGroups[SSL3_JA4_CFG_MAX_LIST];
++    PRUint16 effectiveKeyShareGroups[SSL3_JA4_CFG_MAX_LIST];
++    PRUint16 effectiveExtensionTypes[SSL3_JA4_CFG_MAX_LIST];
++    PRUint8 effectivePskModes[SSL3_JA4_CFG_MAX_LIST];
++    SECItem requestedAlpn = { siBuffer, NULL, 0 };
++    unsigned int effectiveCipherCount = 0;
++    unsigned int effectiveSupportedVersionCount = 0;
++    unsigned int effectiveSupportedGroupCount = 0;
++    unsigned int effectiveKeyShareGroupCount = 0;
++    unsigned int effectiveExtensionCount = 0;
++    unsigned int effectivePskModeCount = 0;
++    unsigned int parsedCount = 0;
++    PRUint32 effectiveMask = (cfg ? cfg->mismatchMask : 0u) | mismatchMask;
++    PRBool hasParsedExtensions = PR_FALSE;
++    PRBool hasSni = PR_FALSE;
++    const char *path = getenv("NSS_JA4_DUMP");
++    FILE *fp;
++    unsigned int i;
++
++    if (!path || !*path) {
++        return;
++    }
++
++    fp = fopen(path, "w");
++    if (!fp) {
++        return;
++    }
++
++    if (extensionBuf) {
++        hasParsedExtensions = ssl3_Ja4ParseExtensionBuffer(
++            extensionBuf, parsed, PR_ARRAY_SIZE(parsed), &parsedCount);
++    }
++    (void)ssl3_Ja4CollectEffectiveCipherSuites(ss, effectiveCiphers,
++                                               PR_ARRAY_SIZE(effectiveCiphers),
++                                               &effectiveCipherCount);
++    (void)ssl3_Ja4CollectSupportedVersions(extensionBuf, effectiveSupportedVersions,
++                                           PR_ARRAY_SIZE(effectiveSupportedVersions),
++                                           &effectiveSupportedVersionCount);
++    (void)ssl3_Ja4CollectSupportedGroups(extensionBuf, effectiveSupportedGroups,
++                                         PR_ARRAY_SIZE(effectiveSupportedGroups),
++                                         &effectiveSupportedGroupCount);
++    (void)ssl3_Ja4CollectKeyShareGroups(extensionBuf, effectiveKeyShareGroups,
++                                        PR_ARRAY_SIZE(effectiveKeyShareGroups),
++                                        &effectiveKeyShareGroupCount);
++    (void)ssl3_Ja4CollectPskKeyExchangeModes(extensionBuf, effectivePskModes,
++                                             PR_ARRAY_SIZE(effectivePskModes),
++                                             &effectivePskModeCount);
++    (void)ssl3_Ja4CollectEffectiveExtensionTypes(extensionBuf,
++                                                 effectiveExtensionTypes,
++                                                 PR_ARRAY_SIZE(effectiveExtensionTypes),
++                                                 &effectiveExtensionCount);
++
++    if (hasParsedExtensions) {
++        for (i = 0; i < parsedCount; ++i) {
++            if (parsed[i].type == ssl_server_name_xtn) {
++                hasSni = PR_TRUE;
++                break;
++            }
++        }
++    } else {
++        for (i = 0; i < ss->xtnData.numAdvertised; ++i) {
++            if (ss->xtnData.advertised[i] == ssl_server_name_xtn) {
++                hasSni = PR_TRUE;
++                break;
++            }
++        }
++    }
++
++    fprintf(fp, "active=%u\n", cfg ? 1u : 0u);
++    fprintf(fp, "apply_ok=%u\n", effectiveMask ? 0u : 1u);
++    fprintf(fp, "mismatch_mask=%u\n", (unsigned int)effectiveMask);
++    fprintf(fp, "effective_tls_min=%u\n", (unsigned int)ss->vrange.min);
++    fprintf(fp, "effective_tls_max=%u\n", (unsigned int)ss->vrange.max);
++    fprintf(fp, "strict=%u\n", (cfg && cfg->strict) ? 1u : 0u);
++    fprintf(fp, "sni_mode=%s\n",
++            (cfg && cfg->hasSniMode)
++                ? ssl3_Ja4SniModeStr(cfg->sniMode)
++                : (hasSni ? "present" : "none"));
++    fprintf(fp, "enable_grease=%u\n", ss->opt.enableGrease ? 1u : 0u);
++    fprintf(fp, "enable_ch_xtn_permutation=%u\n",
++            ss->opt.enableChXtnPermutation ? 1u : 0u);
++    if (cfg && cfg->greaseValueSet) {
++        fprintf(fp, "grease_value=%u\n", (unsigned int)cfg->greaseValue);
++    } else {
++        fprintf(fp, "grease_value=\n");
++    }
++
++    fprintf(fp, "requested_cipher_suites=");
++    if (cfg && cfg->hasCipherSuites) {
++        ssl3_Ja4DumpU16List(fp, (const PRUint16 *)cfg->cipherSuites,
++                            cfg->cipherSuiteCount);
++    }
++    fputc('\n', fp);
++    fprintf(fp, "requested_alpn=");
++    if (cfg && cfg->hasAlpn) {
++        requestedAlpn.data = cfg->alpn;
++        requestedAlpn.len = cfg->alpnLen;
++        ssl3_Ja4DumpAlpn(fp, &requestedAlpn);
++    }
++    fputc('\n', fp);
++    fprintf(fp, "requested_signature_algorithms=");
++    if (cfg && cfg->hasSignatureSchemes) {
++        ssl3_Ja4DumpU16List(fp, (const PRUint16 *)cfg->signatureSchemes,
++                            cfg->signatureSchemeCount);
++    }
++    fputc('\n', fp);
++    fprintf(fp, "requested_extension_order=");
++    if (cfg && cfg->hasExtensionOrder) {
++        ssl3_Ja4DumpU16List(fp, cfg->extensions, cfg->extensionCount);
++    }
++    fputc('\n', fp);
++    fprintf(fp, "requested_supported_versions=");
++    if (cfg && cfg->hasSupportedVersions) {
++        ssl3_Ja4DumpU16List(fp, cfg->supportedVersions,
++                            cfg->supportedVersionCount);
++    }
++    fputc('\n', fp);
++    fprintf(fp, "requested_supported_groups=");
++    if (cfg && cfg->hasSupportedGroups) {
++        ssl3_Ja4DumpU16List(fp, cfg->supportedGroups,
++                            cfg->supportedGroupCount);
++    }
++    fputc('\n', fp);
++    fprintf(fp, "requested_key_share_groups=");
++    if (cfg && cfg->hasKeyShareGroups) {
++        ssl3_Ja4DumpU16List(fp, cfg->keyShareGroups,
++                            cfg->keyShareGroupCount);
++    }
++    fputc('\n', fp);
++    fprintf(fp, "requested_psk_key_exchange_modes=");
++    if (cfg && cfg->hasPskKeyExchangeModes) {
++        ssl3_Ja4DumpU8List(fp, cfg->pskKeyExchangeModes,
++                           cfg->pskKeyExchangeModeCount);
++    }
++    fputc('\n', fp);
++
++    fprintf(fp, "final_cipher_suites=");
++    ssl3_Ja4DumpU16List(fp, effectiveCiphers, effectiveCipherCount);
++    fputc('\n', fp);
++    fprintf(fp, "final_alpn=");
++    ssl3_Ja4DumpAlpn(fp, &ss->opt.nextProtoNego);
++    fputc('\n', fp);
++    fprintf(fp, "final_signature_algorithms=");
++    for (i = 0; i < ss->ssl3.signatureSchemeCount; ++i) {
++        if (i) {
++            fputc(',', fp);
++        }
++        fprintf(fp, "%u", (unsigned int)ss->ssl3.signatureSchemes[i]);
++    }
++    fputc('\n', fp);
++    fprintf(fp, "final_extension_order=");
++    if (hasParsedExtensions) {
++        for (i = 0; i < parsedCount; ++i) {
++            if (i) {
++                fputc(',', fp);
++            }
++            fprintf(fp, "%u", (unsigned int)parsed[i].type);
++        }
++    } else {
++        for (i = 0; i < ss->xtnData.numAdvertised; ++i) {
++            if (i) {
++                fputc(',', fp);
++            }
++            fprintf(fp, "%u", (unsigned int)ss->xtnData.advertised[i]);
++        }
++    }
++    fputc('\n', fp);
++    fprintf(fp, "final_supported_versions=");
++    ssl3_Ja4DumpU16List(fp, effectiveSupportedVersions,
++                        effectiveSupportedVersionCount);
++    fputc('\n', fp);
++    fprintf(fp, "final_supported_groups=");
++    ssl3_Ja4DumpU16List(fp, effectiveSupportedGroups,
++                        effectiveSupportedGroupCount);
++    fputc('\n', fp);
++    fprintf(fp, "final_key_share_groups=");
++    ssl3_Ja4DumpU16List(fp, effectiveKeyShareGroups,
++                        effectiveKeyShareGroupCount);
++    fputc('\n', fp);
++    fprintf(fp, "final_psk_key_exchange_modes=");
++    ssl3_Ja4DumpU8List(fp, effectivePskModes, effectivePskModeCount);
++    fputc('\n', fp);
++
++    ssl3_Ja4DumpRequestedCipherState(fp, ss, cfg);
++    fclose(fp);
++}
++
+ /* This list of SSL3 cipher suites is sorted in descending order of
+  * precedence (desirability).  It only includes cipher suites we implement.
+  * This table is modified by SSL3_SetPolicy(). The ordering of cipher suites
+@@ -5337,14 +7522,36 @@ ssl3_AppendCipherSuites(sslSocket *ss, PRBool fallbackSCSV, sslBuffer *buf)
+     }
+ 
+     saveLen = SSL_BUFFER_LEN(buf);
+-    /* CipherSuites are appended to Hello message here */
+-    for (i = 0; i < ssl_V3_SUITES_IMPLEMENTED; i++) {
+-        ssl3CipherSuiteCfg *suite = &ss->cipherSuites[i];
+-        if (ssl3_config_match(suite, ss->ssl3.policy, &ss->vrange, ss)) {
+-            rv = sslBuffer_AppendNumber(buf, suite->cipher_suite,
+-                                        sizeof(ssl3CipherSuite));
+-            if (rv != SECSuccess) {
+-                return SECFailure;
++    {
++        const ssl3Ja4SlimConfig *ja4cfg = ssl3_Ja4GetActiveConfig();
++        if (ja4cfg && ja4cfg->hasCipherSuites && ja4cfg->hasCipherMode &&
++            ja4cfg->cipherMode == ssl3Ja4CipherModeExact) {
++            /* JA4 EXACT-mode raw emission: write the user-requested 2-byte
++             * IDs verbatim, including IDs that have no compiled SSL_CIPHER.
++             * The server-visible JA4_b reflects the exact list. If the
++             * server picks a fake ID, ServerHello processing aborts at
++             * ssl3_FindCipherSuiteByID time — out of scope for JA4
++             * imitation. The native table loop is bypassed to keep the
++             * order identical to cfg->cipherSuites[]. */
++            unsigned int j;
++            for (j = 0; j < ja4cfg->cipherSuiteCount; ++j) {
++                rv = sslBuffer_AppendNumber(buf, ja4cfg->cipherSuites[j],
++                                            sizeof(ssl3CipherSuite));
++                if (rv != SECSuccess) {
++                    return SECFailure;
++                }
++            }
++        } else {
++            /* CipherSuites are appended to Hello message here */
++            for (i = 0; i < ssl_V3_SUITES_IMPLEMENTED; i++) {
++                ssl3CipherSuiteCfg *suite = &ss->cipherSuites[i];
++                if (ssl3_config_match(suite, ss->ssl3.policy, &ss->vrange, ss)) {
++                    rv = sslBuffer_AppendNumber(buf, suite->cipher_suite,
++                                                sizeof(ssl3CipherSuite));
++                    if (rv != SECSuccess) {
++                        return SECFailure;
++                    }
++                }
+             }
+         }
+     }
+@@ -5513,6 +7720,9 @@ ssl3_SendClientHello(sslSocket *ss, sslClientHelloType type)
+     PRUint16 version = ss->vrange.max;
+     PRInt32 flags;
+     sslBuffer chBuf = SSL_BUFFER_EMPTY;
++    ssl3Ja4SlimConfig ja4cfg;
++    PRUint32 ja4MismatchMask = 0;
++    PRBool hasJa4Config = PR_FALSE;
+ 
+     SSL_TRC(3, ("%d: SSL3[%d]: send %s ClientHello handshake", SSL_GETPID(),
+                 ss->fd, ssl_ClientHelloTypeName(type)));
+@@ -5549,6 +7759,16 @@ ssl3_SendClientHello(sslSocket *ss, sslClientHelloType type)
+     if (ssl3_config_match_init(ss) == 0) {
+         return SECFailure; /* ssl3_config_match_init has set error code. */
+     }
++    hasJa4Config = ssl3_Ja4LoadConfigFromEnv(&ja4cfg);
++    if (hasJa4Config) {
++        ssl3_Ja4SetActiveConfig(&ja4cfg);
++        ssl3_Ja4ApplySocketConfig(ss, &ja4cfg);
++        if (ssl3_config_match_init(ss) == 0) {
++            ssl3_Ja4SetActiveConfig(NULL);
++            return SECFailure; /* ssl3_config_match_init has set error code. */
++        }
++        version = ss->vrange.max;
++    }
+ 
+     /*
+      * During a renegotiation, ss->clientHelloVersion will be used again to
+@@ -5779,6 +7999,9 @@ ssl3_SendClientHello(sslSocket *ss, sslClientHelloType type)
+         if (rv != SECSuccess) {
+             goto loser;
+         }
++        if (hasJa4Config) {
++            ssl3_Ja4MaybeOverrideGrease(ss, &ja4cfg);
++        }
+     }
+ 
+     /* Setup TLS ClientHello Extension Permutation? */
+@@ -5797,6 +8020,17 @@ ssl3_SendClientHello(sslSocket *ss, sslClientHelloType type)
+             goto loser;
+         }
+     }
++    if (hasJa4Config) {
++        rv = ssl3_Ja4RewriteTls13ExtensionBodies(ss, &ja4cfg, &extensionBuf);
++        if (rv != SECSuccess) {
++            goto loser;
++        }
++        ssl3_Ja4SyncXtnDataFromBuffer(ss, &extensionBuf);
++        rv = ssl3_Ja4RewriteClientExtensions(ss, &ja4cfg, &extensionBuf);
++        if (rv != SECSuccess) {
++            goto loser;
++        }
++    }
+ 
+     if (IS_DTLS(ss)) {
+         ssl3_DisableNonDTLSSuites(ss);
+@@ -5818,6 +8052,20 @@ ssl3_SendClientHello(sslSocket *ss, sslClientHelloType type)
+             if (rv != SECSuccess) {
+                 goto loser; /* err set by ssl_InsertPaddingExtension. */
+             }
++            if (hasJa4Config) {
++                rv = ssl3_Ja4FinalizeClientExtensions(ss, &ja4cfg,
++                                                      &extensionBuf);
++                if (rv != SECSuccess) {
++                    goto loser;
++                }
++                rv = ssl3_Ja4EnforceStrictConfig(ss, &ja4cfg, &extensionBuf,
++                                                 &ja4MismatchMask);
++                if (rv != SECSuccess) {
++                    goto loser;
++                }
++            }
++            ssl3_Ja4MaybeDumpConfig(ss, hasJa4Config ? &ja4cfg : NULL,
++                                    ja4MismatchMask, &extensionBuf);
+ 
+             rv = ssl3_InsertChHeaderSize(ss, &chBuf, &extensionBuf);
+             if (rv != SECSuccess) {
+@@ -5874,6 +8122,15 @@ ssl3_SendClientHello(sslSocket *ss, sslClientHelloType type)
+         if (rv != SECSuccess) {
+             goto loser; /* code set */
+         }
++        if (hasJa4Config) {
++            rv = ssl3_Ja4EnforceStrictConfig(ss, &ja4cfg, &extensionBuf,
++                                             &ja4MismatchMask);
++            if (rv != SECSuccess) {
++                goto loser;
++            }
++        }
++        ssl3_Ja4MaybeDumpConfig(ss, hasJa4Config ? &ja4cfg : NULL,
++                                ja4MismatchMask, &extensionBuf);
+         rv = ssl3_UpdateDefaultHandshakeHashes(ss, chBuf.buf, chBuf.len);
+         if (rv != SECSuccess) {
+             goto loser; /* code set */
+@@ -5923,6 +8180,7 @@ ssl3_SendClientHello(sslSocket *ss, sslClientHelloType type)
+     }
+ 
+     ss->ssl3.hs.ws = wait_server_hello;
++    ssl3_Ja4SetActiveConfig(NULL);
+     sslBuffer_Clear(&chBuf);
+     sslBuffer_Clear(&extensionBuf);
+     return SECSuccess;
+@@ -5931,6 +8189,7 @@ loser:
+     if (unlockNeeded) {
+         PR_RWLock_Unlock(sid->u.ssl3.lock);
+     }
++    ssl3_Ja4SetActiveConfig(NULL);
+     sslBuffer_Clear(&chBuf);
+     sslBuffer_Clear(&extensionBuf);
+     return SECFailure;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "profile_id": "captured-1777299275300",
+  "metadata": {
+    "name": "Tor",
+    "source": "captured",
+    "captured_at": "2026-04-27T14:12:36.317634",
+    "icon_url": "https://upload.wikimedia.org/wikipedia/commons/1/15/Tor-logo-2011-flat.svg",
+    "version": "14.x",
+    "notes": "JA4: t13d1712h2_5b57614c22b0_162f41844ab7. Captured from a JA4 observation endpoint. No GREASE, no extension permutation."
+  },
+  "inputs": {
+    "tls_client_hello": {
+      "tls_min_version": "1.2",
+      "tls_max_version": "1.3",
+      "cipher_suites": [
+        4865,
+        4867,
+        4866,
+        49195,
+        49199,
+        52393,
+        52392,
+        49196,
+        49200,
+        49162,
+        49161,
+        49171,
+        49172,
+        156,
+        157,
+        47,
+        53
+      ],
+      "alpn_protocols": [
+        "h2",
+        "http/1.1"
+      ],
+      "extensions": [
+        0,
+        23,
+        65281,
+        10,
+        11,
+        16,
+        5,
+        34,
+        18,
+        51,
+        43,
+        13,
+        28,
+        27,
+        65037
+      ],
+      "signature_algorithms": [
+        1027,
+        1283,
+        1539,
+        2052,
+        2053,
+        2054,
+        1025,
+        1281,
+        1537,
+        515,
+        513
+      ],
+      "supported_versions": [
+        772,
+        771
+      ],
+      "supported_groups": [
+        29,
+        23,
+        24,
+        25
+      ],
+      "key_share_groups": [
+        29
+      ],
+      "psk_key_exchange_modes": [],
+      "enable_grease": false,
+      "enable_ch_xtn_permutation": false,
+      "sni_mode": "present"
+    }
+  }
+}
