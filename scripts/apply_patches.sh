@@ -5,15 +5,19 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 with_wip=0
+force=0
 
 filter_sub=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/apply_patches.sh [--with-wip] [--only <submodule>]
+Usage: scripts/apply_patches.sh [--with-wip] [--only <submodule>] [--force]
 
   --with-wip          Also apply *.diff files from patches/<lib>/ after git-am patches.
   --only <submodule>  Only patch the given submodule (e.g. nss, openssl, boringssl).
+  --force             Reset my-changes even when it carries WIP commits or a
+                      dirty working tree. Default behaviour aborts to prevent
+                      silent data loss.
 USAGE
 }
 
@@ -29,6 +33,9 @@ while [[ $# -gt 0 ]]; do
         echo "[error] --only requires a submodule name" >&2
         exit 1
       fi
+      ;;
+    --force)
+      force=1
       ;;
     -h|--help)
       usage
@@ -80,6 +87,37 @@ for name in "${submodules[@]}"; do
 
   echo "[info] $name: fetching upstream"
   git -C "$sub_path" fetch origin >/dev/null
+
+  # Protect any work-in-progress on an existing `my-changes` branch before
+  # we reset it. Two cases lose data silently otherwise:
+  #   1. The user committed extra work on top of the applied patches.
+  #   2. The working tree has uncommitted edits.
+  if [[ "$force" -ne 1 ]] && \
+      git -C "$sub_path" rev-parse --verify --quiet my-changes >/dev/null; then
+    ahead=$(git -C "$sub_path" rev-list --count "$upstream_ref..my-changes" 2>/dev/null || echo 0)
+    patch_count=0
+    if [[ -d "$patch_dir" ]]; then
+      shopt -s nullglob
+      patches=("$patch_dir"/*.patch)
+      patch_count=${#patches[@]}
+      shopt -u nullglob
+    fi
+    if [[ "$ahead" -gt "$patch_count" ]]; then
+      extra=$((ahead - patch_count))
+      echo "[error] $name: my-changes has $ahead commits past $upstream_ref but only $patch_count patches will be applied." >&2
+      echo "[error] $name: refusing to reset (would lose $extra commit(s))." >&2
+      echo "[hint]  scripts/refresh_patches.sh --with-wip can capture the extra work as .diff files." >&2
+      echo "[hint]  pass --force to override and discard." >&2
+      exit 1
+    fi
+    current_branch=$(git -C "$sub_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [[ "$current_branch" == "my-changes" ]] && \
+        ! git -C "$sub_path" diff --quiet 2>/dev/null; then
+      echo "[error] $name: working tree has uncommitted changes in libs/$name." >&2
+      echo "[hint]  commit, stash, or discard them; or pass --force to override." >&2
+      exit 1
+    fi
+  fi
 
   echo "[info] $name: checking out $upstream_ref"
   git -C "$sub_path" checkout -q "$upstream_ref"

@@ -70,6 +70,15 @@ class AppLauncherController extends ChangeNotifier {
   bool loading = true;
   List<AppState> apps = [];
 
+  /// Per-submodule mutex queue. Two apps that share a submoduleName
+  /// (e.g. Chromium and any future Brave-style build, both BoringSSL)
+  /// must not run patch + build concurrently — they would interleave
+  /// writes to `libs/<sub>` and corrupt each other's source tree.
+  ///
+  /// Each entry holds the future of the currently active or queued
+  /// holder; new callers chain after it.
+  final Map<String, Future<void>> _submoduleLocks = {};
+
   void updateLaunchArguments(AppState app, String value) {
     if (app.launchArguments == value) return;
     app.launchArguments = value;
@@ -253,6 +262,9 @@ class AppLauncherController extends ChangeNotifier {
   Future<void> smartLaunch(AppState app, {FingerprintProfile? profile}) async {
     if (app.smartLaunchInProgress) return;
     app.smartLaunchInProgress = true;
+
+    final sub = app.submoduleName;
+    Completer<void>? release;
     try {
       final userArgs = _parseUserArgs(app.launchArguments);
       final args = [
@@ -264,10 +276,28 @@ class AppLauncherController extends ChangeNotifier {
       ];
 
       // Already built AND patch-stamp matches current patches → just launch.
+      // The launch step does not touch the shared submodule tree, so we can
+      // skip the per-submodule mutex in this fast path.
       if (app.buildState == AppBuildState.built &&
           await _patchStampMatches(app)) {
         await launchApp(app, args);
         return;
+      }
+
+      // Acquire per-submodule lock before any patch/build work. This
+      // serializes apps that share `libs/<sub>` — concurrent patch runs
+      // would otherwise interleave writes and corrupt the source tree.
+      if (sub != null) {
+        final previous = _submoduleLocks[sub];
+        release = Completer<void>();
+        _submoduleLocks[sub] = release.future;
+        if (previous != null) {
+          try {
+            await previous;
+          } catch (_) {
+            // Previous holder may have thrown; we still get our turn.
+          }
+        }
       }
 
       // 1. Patch if needed (always run when stamp mismatched, even if patched flag is true).
@@ -291,6 +321,12 @@ class AppLauncherController extends ChangeNotifier {
       // 3. Launch (keep prior output from patch + build steps)
       await launchApp(app, args, clearOutput: false);
     } finally {
+      if (release != null && sub != null) {
+        if (_submoduleLocks[sub] == release.future) {
+          _submoduleLocks.remove(sub);
+        }
+        release.complete();
+      }
       app.smartLaunchInProgress = false;
       notifyListeners();
     }

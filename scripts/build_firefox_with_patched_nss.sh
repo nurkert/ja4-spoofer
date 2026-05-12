@@ -336,6 +336,9 @@ mozconfig_path="$workdir/mozconfig-ja4-stable"
 if [[ ! -d "$src_dir/.git" ]]; then
   echo "[info] cloning Firefox source ($branch) into $src_dir"
   retry 3 5 git clone --branch "$branch" --single-branch --depth 1 "$repo_url" "$src_dir"
+  # Mark this checkout as managed by ja4-spoofer so destructive cleanups
+  # below are gated to it and won't touch a developer's own gecko-dev.
+  touch "$src_dir/.ja4-managed-checkout"
 else
   echo "[info] reusing existing source in $src_dir"
   cleanup_git_locks "$src_dir"
@@ -343,9 +346,16 @@ else
 fi
 
   # Clean stale untracked files from previous checkouts (e.g. different branches
-  # may leave behind files that break the build system).
-  echo "[info] cleaning untracked files from source tree"
-  git -C "$src_dir" clean -fd -q 2>/dev/null || true
+  # may leave behind files that break the build system). Gated to ja4-managed
+  # checkouts so a stray `--workdir` pointing at someone's own gecko-dev tree
+  # cannot wipe their work.
+  if [[ -f "$src_dir/.ja4-managed-checkout" ]]; then
+    echo "[info] cleaning untracked files from source tree"
+    git -C "$src_dir" clean -fd -q 2>/dev/null || true
+  else
+    echo "[warn] $src_dir is not a ja4-managed checkout (no .ja4-managed-checkout marker)"
+    echo "[warn] skipping 'git clean -fd' to preserve any local work"
+  fi
 
 if [[ -n "$ref" ]]; then
   echo "[info] checking out pinned ref $ref"

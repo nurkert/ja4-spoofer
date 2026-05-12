@@ -2,6 +2,7 @@
 # Shared helpers for patch management scripts.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/util.sh"
 
 submodules=(
   "openssl"
@@ -37,10 +38,7 @@ get_managed_lib_url() {
   fi
 
   local manifest="$REPO_ROOT/configs/managed-libs.env"
-  if [[ -f "$manifest" ]]; then
-    # shellcheck disable=SC1090
-    source "$manifest"
-  fi
+  load_env_config "$manifest"
 
   case "$name" in
     openssl) url="${OPENSSL_URL:-}" ;;
