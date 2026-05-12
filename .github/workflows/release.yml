@@ -111,13 +111,13 @@ jobs:
 
       - name: Cache Flutter SDK
         id: cache_flutter
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /root/flutter
           key: flutter-sdk-${{ steps.flutter_version.outputs.version }}-bullseye
 
       - name: Cache pub packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /root/.pub-cache
           key: pub-cache-${{ steps.flutter_version.outputs.version }}-${{ hashFiles('tools/ja4-spoofer/pubspec.lock') }}
