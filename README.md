@@ -61,13 +61,29 @@ In the GUI:
    patch stack, builds the target and launches it. Later runs launch directly
    while the patch stamp is still fresh.
 
+**Launch** — Select a TLS profile and click an app to patch, build and launch it in one step. The button reads "Patch, Build & Launch" on the first run and shrinks to "Launch" once a fresh binary exists.
+
 <p align="center">
-  <img src="assets/launcher.png" alt="JA4 Spoofer — Launch tab" width="680">
+  <img src="assets/launcher.png" alt="Launch tab" width="100%">
 </p>
 
-| TLS Configurator | Profile Library | JA4 Capture |
-|---|---|---|
-| <img src="assets/configurator.png" alt="TLS Configurator" width="220"> | <img src="assets/profiles.png" alt="Profile Library" width="220"> | <img src="assets/capture.png" alt="JA4 Capture" width="220"> |
+**TLS Configurator** — Edit every JA4-relevant ClientHello field: TLS version range, cipher suites, extension order, ALPN, signature algorithms, named groups, GREASE and SNI behavior. Changes sync live to the active profile.
+
+<p align="center">
+  <img src="assets/configurator.png" alt="TLS Configurator" width="100%">
+</p>
+
+**Profile Library** — Browse, search and manage saved fingerprint profiles. Ships with pre-captured seed profiles for Safari, Firefox, Chromium, Tor, Brave, Zen, Apple Mail and curl.
+
+<p align="center">
+  <img src="assets/profiles.png" alt="Profile Library" width="100%">
+</p>
+
+**JA4 Capture** — Starts a local TLS proxy and records ClientHello fingerprints from any connecting client. Each capture can be saved as a profile and replayed exactly.
+
+<p align="center">
+  <img src="assets/capture.png" alt="JA4 Capture" width="100%">
+</p>
 
 Build times vary heavily. curl/OpenSSL is usually quick, Firefox can take around
 an hour on a laptop, and Chromium can take several hours plus significant disk
