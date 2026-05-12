@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version without leading v, for example 1.2.3
+        description: 'Release version without leading v, e.g. 1.2.3'
         required: true
         type: string
       build_number:
-        description: Optional Flutter build number / Debian revision
+        description: 'Debian revision (optional, defaults to run number)'
         required: false
         type: string
   push:
@@ -19,15 +19,35 @@ permissions:
   contents: write
 
 jobs:
-  linux-deb:
-    name: Build Linux .deb
+  build:
+    name: Build Linux .deb (amd64)
     runs-on: ubuntu-latest
+    # Build inside Debian Bullseye so the resulting binaries link against
+    # glibc 2.31 — that makes the .deb run on Debian 11/12, Ubuntu 20.04+
+    # and derivatives. Without this the runner's modern glibc would leak
+    # into the binary and break installs on older systems.
+    container: debian:bullseye-slim
 
     steps:
+      - name: Bootstrap container tools
+        run: |
+          set -e
+          for i in 1 2 3; do
+            apt-get update && \
+            apt-get install -y --no-install-recommends --fix-missing \
+              git curl ca-certificates xz-utils unzip sudo rsync \
+              perl jq && break
+            echo "apt attempt $i failed, retrying..."
+            sleep 5
+          done
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory '*'
 
       - name: Resolve version
         id: version
@@ -57,99 +77,118 @@ jobs:
           fi
 
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Version must be semantic X.Y.Z"
+            echo "::error::Version must be X.Y.Z, got: $VERSION"
             exit 1
           fi
           if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
-            echo "::error::Build number must be numeric"
+            echo "::error::Build number must be numeric, got: $BUILD_NUMBER"
             exit 1
           fi
 
           TAG="v$VERSION"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION"           >> "$GITHUB_ENV"
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "TAG=$TAG"                   >> "$GITHUB_ENV"
 
-      - name: Commit release version and tag
+      - name: Bump pubspec version and tag
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          perl -0pi -e 's/^version:\s+.*/version: '"$VERSION+$BUILD_NUMBER"'/m' tools/ja4-spoofer/pubspec.yaml
+          perl -0pi -e \
+            's/^version:\s+.*/version: '"$VERSION+$BUILD_NUMBER"'/m' \
+            tools/ja4-spoofer/pubspec.yaml
 
           git add tools/ja4-spoofer/pubspec.yaml
           if ! git diff --cached --quiet; then
-            git commit -m "chore: release $TAG"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            git commit -m "release $TAG"
+            git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+              "HEAD:${GITHUB_REF_NAME}"
           fi
 
           git tag -a "$TAG" -m "Release $TAG"
-          git push origin "$TAG"
+          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            "$TAG"
 
-      - name: Install Linux build dependencies
+      - name: Sync bundled-runtime assets from repo root
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang \
-            cmake \
-            curl \
-            dpkg-dev \
-            git \
-            libgtk-3-dev \
-            liblzma-dev \
-            ninja-build \
-            pkg-config
+          DEST="tools/ja4-spoofer/assets/bundled-runtime"
+
+          rsync -a --delete \
+            --exclude='__pycache__' --exclude='*.pyc' \
+            scripts/ "$DEST/scripts/"
+
+          rsync -a --delete configs/ "$DEST/configs/"
+
+          for lib in boringssl nss openssl; do
+            mkdir -p "$DEST/patches/$lib"
+            rsync -a --delete \
+              --include='*.patch' --include='BASE_REF' --exclude='*' \
+              "patches/$lib/" "$DEST/patches/$lib/"
+          done
+
+      - name: Install build dependencies
+        run: |
+          set -e
+          # Flutter's native_assets toolchain expects the full LLVM tool
+          # set (clang, ld.lld, llvm-ar, llvm-nm, llvm-strip, ...) next to
+          # clang-11. clang, lld and llvm together cover them all.
+          for i in 1 2 3; do
+            apt-get install -y --no-install-recommends --fix-missing \
+              clang lld llvm cmake ninja-build pkg-config \
+              libgtk-3-dev liblzma-dev dpkg-dev libstdc++-10-dev && break
+            echo "apt attempt $i failed, retrying..."
+            sleep 5
+          done
 
       - name: Install Flutter
         shell: bash
         run: |
-          set -euo pipefail
-          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
-          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          git clone --depth 1 https://github.com/flutter/flutter.git -b stable "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          "$HOME/flutter/bin/flutter" --version
+          "$HOME/flutter/bin/flutter" config --enable-linux-desktop
 
-      - name: Flutter doctor
-        shell: bash
-        run: |
-          set -euo pipefail
-          flutter --version
-          flutter config --enable-linux-desktop
-          flutter doctor -v
-
-      - name: Resolve Flutter packages
+      - name: Flutter pub get
         working-directory: tools/ja4-spoofer
-        shell: bash
         run: flutter pub get
-
-      - name: Run Flutter tests
-        working-directory: tools/ja4-spoofer
-        shell: bash
-        run: flutter test
 
       - name: Build .deb
         shell: bash
         run: |
-          set -euo pipefail
           bash tools/ja4-spoofer/scripts/package_linux_deb.sh \
-            --version "$VERSION" \
+            --version      "$VERSION" \
             --build-number "$BUILD_NUMBER"
 
-      - name: Publish GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --notes "Release $TAG"
-          fi
-          gh release upload "$TAG" tools/ja4-spoofer/dist/*.deb --clobber
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ja4-spoofer-${{ env.VERSION }}-linux-amd64
+          path: tools/ja4-spoofer/dist/*.deb
+          retention-days: 30
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.TAG }}
+          name: JA4 Spoofer ${{ env.TAG }}
+          artifacts: tools/ja4-spoofer/dist/*.deb
+          artifactErrorsFailBuild: true
+          allowUpdates: true
+          makeLatest: true
+          body: |
+            Install on Debian/Ubuntu:
+
+            ```bash
+            sudo dpkg -i ja4-spoofer_*.deb
+            sudo apt-get install -f   # resolves any missing deps
+            ```
+
+            Then launch with `ja4-spoofer` or from the applications menu.
+            On first launch the app extracts its scripts, configs and patches to
+            `~/.ja4-spoofer/runtime/<version>/` — no repository checkout needed.

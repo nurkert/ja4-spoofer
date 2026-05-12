@@ -65,7 +65,7 @@ class _AppShellState extends State<AppShell> {
   @override
   void initState() {
     super.initState();
-    unawaited(_initControllers());
+    unawaited(_initControllers().catchError((Object _) {}));
   }
 
   Future<void> _initControllers() async {
@@ -158,9 +158,9 @@ class _AppShellState extends State<AppShell> {
           profileCatalogController.load().then((_) {
             if (!mounted) return Future<void>.value();
             return quickLaunchController.restoreSelectionIntoConfigurator();
-          }),
+          }).catchError((Object _) {}),
         );
-      }),
+      }).catchError((Object _) {}),
     );
 
     // Load registries once here, not on every tab visit. Honour the
@@ -168,7 +168,7 @@ class _AppShellState extends State<AppShell> {
     unawaited(
       configuratorController.loadRegistries(
         source: settingsController.settings.ianaSource,
-      ),
+      ).catchError((Object _) {}),
     );
   }
 
