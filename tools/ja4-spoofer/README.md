@@ -4,19 +4,31 @@ Desktop GUI for controlled JA4 fingerprint experiments with Chromium, Brave-styl
 
 ## Quickstart
 
-For normal Linux users, install the `.deb` from GitHub Releases and start
-`ja4-spoofer`. The app extracts its scripts, configs and patches to
+For normal Linux users, install via the Nurkert APT repository and start
+`ja4-spoofer`:
+
+```bash
+sudo mkdir -p /usr/share/keyrings
+curl -fsSL https://apt.nurkert.de/KEY.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nurkert-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/nurkert-archive-keyring.gpg] https://apt.nurkert.de stable main" \
+  | sudo tee /etc/apt/sources.list.d/nurkert.list
+sudo apt update && sudo apt install ja4-spoofer
+```
+
+The app extracts its scripts, configs and patches to
 `~/.ja4-spoofer/runtime/<version>/` automatically; no repository path needs to
-be configured in Settings.
+be configured in Settings. See the [root README](../../README.md#installation)
+for alternative install methods (direct `.deb`, build from source, build your
+own `.deb`).
 
 For source development:
 
 ```bash
-git clone <repo> && cd <repo>
-git submodule update --init --recursive
+git clone https://github.com/nurkert/ja4-spoofer && cd ja4-spoofer
 cd tools/ja4-spoofer
 flutter pub get
-flutter run -d macos      # or -d linux / -d windows
+flutter run -d linux      # or -d macos / -d windows
 ```
 
 In the GUI:

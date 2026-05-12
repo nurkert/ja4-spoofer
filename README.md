@@ -33,24 +33,111 @@ fingerprinting research, and defensive analysis. Do not use it to bypass access
 controls, impersonate users, evade abuse detection, or violate the terms of
 services you do not control.
 
-## Quickstart
+## Installation
 
 Installable Linux releases are published as `.deb` files. After installation,
 the GUI extracts its managed scripts, configs and patches to
 `~/.ja4-spoofer/runtime/<version>/`; users do not need to point the app at a
 repository checkout.
 
-For source development:
+### Install from the APT repository (recommended)
 
 ```bash
-git clone <repo-url>
-cd ja4-spoofer
-git submodule update --init --recursive
+# Add Nurkert APT key
+sudo mkdir -p /usr/share/keyrings
+curl -fsSL https://apt.nurkert.de/KEY.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nurkert-archive-keyring.gpg
 
-cd tools/ja4-spoofer
-flutter pub get
-flutter run -d macos   # or -d linux / -d windows
+# Add repository
+echo "deb [signed-by=/usr/share/keyrings/nurkert-archive-keyring.gpg] https://apt.nurkert.de stable main" \
+  | sudo tee /etc/apt/sources.list.d/nurkert.list
+
+# Install ja4-spoofer
+sudo apt update
+sudo apt install ja4-spoofer
 ```
+
+Upgrades arrive via `sudo apt upgrade` like any other package. Uninstall with
+`sudo apt remove ja4-spoofer`.
+
+### Install a pre-built `.deb`
+
+Grab the latest `ja4-spoofer_*.deb` from the
+[Releases page](https://github.com/nurkert/ja4-spoofer/releases) and install it:
+
+```bash
+sudo dpkg -i ja4-spoofer_*.deb
+sudo apt-get install -f   # resolves any missing deps
+```
+
+### Build it yourself
+
+```bash
+git clone https://github.com/nurkert/ja4-spoofer
+cd ja4-spoofer/tools/ja4-spoofer
+flutter pub get
+flutter build linux --release
+```
+
+The resulting binary will be located at:
+
+```text
+build/linux/x64/release/bundle/ja4_spoofer
+```
+
+To make `ja4_spoofer` globally accessible from your terminal (e.g., just by
+typing `ja4_spoofer`), you can do one of the following:
+
+- **Option 1: Create a symbolic link**
+
+  ```bash
+  sudo ln -s "$(pwd)/build/linux/x64/release/bundle/ja4_spoofer" /usr/local/bin/ja4_spoofer
+  ```
+
+- **Option 2: Copy the binary into a directory in your `$PATH`**
+
+  ```bash
+  sudo cp build/linux/x64/release/bundle/ja4_spoofer /usr/local/bin/
+  ```
+
+Now you can launch the application simply by typing:
+
+```bash
+ja4_spoofer
+```
+
+### Create a Debian package
+
+The repository ships with a helper script that bundles the application into a
+`.deb` file. Run it from the project root and then install the resulting
+package with `dpkg`:
+
+```bash
+bash tools/ja4-spoofer/scripts/package_linux_deb.sh
+sudo dpkg -i tools/ja4-spoofer/dist/ja4-spoofer_*_$(dpkg --print-architecture).deb
+```
+
+After installation the `ja4-spoofer` command is available globally. To remove
+the package again:
+
+```bash
+sudo apt remove ja4-spoofer
+```
+
+Build requirements: Flutter with Linux desktop enabled
+(`flutter config --enable-linux-desktop`), plus
+`clang lld llvm cmake ninja-build pkg-config libgtk-3-dev liblzma-dev dpkg-dev`.
+
+### Run from source (development)
+
+```bash
+git clone https://github.com/nurkert/ja4-spoofer
+cd ja4-spoofer/tools/ja4-spoofer
+flutter pub get
+flutter run -d linux    # or -d macos / -d windows
+```
+
+## Quickstart
 
 In the GUI:
 
