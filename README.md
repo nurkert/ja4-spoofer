@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="tools/ja4-spoofer/assets/icon.png" alt="JA4 Spoofer icon" width="96" height="96">
+  <img src="assets/header.png" alt="JA4 Spoofer" width="100%">
 </p>
 
 # JA4 Spoofer
@@ -60,6 +60,14 @@ In the GUI:
    upstream source on the host, checks out the pinned base ref, applies the
    patch stack, builds the target and launches it. Later runs launch directly
    while the patch stamp is still fresh.
+
+<p align="center">
+  <img src="assets/launcher.png" alt="JA4 Spoofer — Launch tab" width="680">
+</p>
+
+| TLS Configurator | Profile Library | JA4 Capture |
+|---|---|---|
+| <img src="assets/configurator.png" alt="TLS Configurator" width="220"> | <img src="assets/profiles.png" alt="Profile Library" width="220"> | <img src="assets/capture.png" alt="JA4 Capture" width="220"> |
 
 Build times vary heavily. curl/OpenSSL is usually quick, Firefox can take around
 an hour on a laptop, and Chromium can take several hours plus significant disk
@@ -131,3 +139,7 @@ the **GNU General Public License v3.0 or later** (`GPL-3.0-or-later`). See
 Third-party projects under `libs/` keep their own upstream licenses. This
 repository license does not relicense OpenSSL, BoringSSL, NSS, Nginx, JA4 or
 other external submodules.
+
+<p align="center">
+  <img src="tools/ja4-spoofer/assets/icon.png" alt="JA4 Spoofer icon" width="64" height="64">
+</p>
