@@ -48,7 +48,7 @@ class _SafeNetworkIconState extends State<SafeNetworkIcon> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _load();
+    unawaited(_load());
   }
 
   @override
@@ -57,7 +57,7 @@ class _SafeNetworkIconState extends State<SafeNetworkIcon> {
     if (old.url != widget.url) {
       _svgBytes = null;
       _failed = false;
-      _load();
+      unawaited(_load());
     }
   }
 
@@ -111,7 +111,9 @@ class _SafeNetworkIconState extends State<SafeNetworkIcon> {
         _svgFailed.add(url);
         return null;
       } finally {
-        _svgInflight.remove(url);
+        // Map<K, Future<V>>.remove returns the removed Future; we don't need
+        // it but the analyzer needs an explicit acknowledgement.
+        unawaited(_svgInflight.remove(url) ?? Future<void>.value());
       }
     });
   }

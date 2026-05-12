@@ -91,7 +91,7 @@ class ConfiguratorPage extends StatelessWidget {
       text: controller.editingMetadata.name,
     );
     String? selectedFormat = controller.editingMetadata.profileFormat;
-    showShadDialog(
+    unawaited(showShadDialog(
       context: context,
       builder: (dialogContext) => _SaveAsDialog(
         nameCtrl: nameCtrl,
@@ -109,7 +109,7 @@ class ConfiguratorPage extends StatelessWidget {
           }
         },
       ),
-    );
+    ));
   }
 
   @override

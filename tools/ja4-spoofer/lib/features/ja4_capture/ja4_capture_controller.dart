@@ -17,7 +17,7 @@ class Ja4CaptureController extends ChangeNotifier {
     required ProfileCatalogController profileCatalogController,
   }) : _server = Ja4CaptureServer(port: port),
        _profileCatalogController = profileCatalogController {
-    _loadSettings();
+    unawaited(_loadSettings());
   }
 
   final Ja4CaptureServer _server;
@@ -143,7 +143,7 @@ class Ja4CaptureController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _throttleTimer?.cancel();
-    _captureSub?.cancel();
+    unawaited(_captureSub?.cancel() ?? Future<void>.value());
     _server.dispose();
     super.dispose();
   }

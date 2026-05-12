@@ -323,7 +323,9 @@ class AppLauncherController extends ChangeNotifier {
     } finally {
       if (release != null && sub != null) {
         if (_submoduleLocks[sub] == release.future) {
-          _submoduleLocks.remove(sub);
+          // Map<K, Future<void>>.remove returns the removed Future; we
+          // don't need to wait on it, just drop the entry.
+          unawaited(_submoduleLocks.remove(sub) ?? Future<void>.value());
         }
         release.complete();
       }
@@ -530,8 +532,8 @@ class AppLauncherController extends ChangeNotifier {
   @override
   void dispose() {
     for (final app in apps) {
-      app.stdoutSub?.cancel();
-      app.stderrSub?.cancel();
+      unawaited(app.stdoutSub?.cancel() ?? Future<void>.value());
+      unawaited(app.stderrSub?.cancel() ?? Future<void>.value());
       if (app.runningScript != null) {
         _launcherService.stop(app.runningScript!.process, force: true);
       }

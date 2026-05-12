@@ -62,13 +62,43 @@ class _AppShellState extends State<AppShell> {
   ProfileCatalogController? _profileCatalogController;
   ProfileLibraryController? _profileLibraryController;
 
+  /// Re-entry guard for [_initControllers]. Settings-save triggers a re-init
+  /// (see [_buildPage] '/settings'); without this, a rapid toggle would
+  /// start a second `_initControllers` while the first is still inside
+  /// `ScriptBundleService.ensureExtracted()`, leaving both racing on
+  /// `dispose()` and `setState`.
+  bool _initInProgress = false;
+
+  void _reportInitError(Object error, [StackTrace? stack]) {
+    debugPrint('AppShell init failure: $error');
+    if (stack != null) debugPrintStack(stackTrace: stack);
+    if (!mounted) return;
+    ShadSonner.of(context).show(
+      ShadToast.destructive(
+        description: Text('Initialisation failed: $error'),
+      ),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
-    unawaited(_initControllers().catchError((Object _) {}));
+    unawaited(_initControllers());
   }
 
   Future<void> _initControllers() async {
+    if (_initInProgress) return;
+    _initInProgress = true;
+    try {
+      await _initControllersUnchecked();
+    } catch (e, st) {
+      _reportInitError(e, st);
+    } finally {
+      _initInProgress = false;
+    }
+  }
+
+  Future<void> _initControllersUnchecked() async {
     _quickLaunchController?.dispose();
     _profileLibraryController?.dispose();
     _profileCatalogController?.dispose();
@@ -158,17 +188,23 @@ class _AppShellState extends State<AppShell> {
           profileCatalogController.load().then((_) {
             if (!mounted) return Future<void>.value();
             return quickLaunchController.restoreSelectionIntoConfigurator();
-          }).catchError((Object _) {}),
+          }).catchError((Object e, StackTrace st) {
+            _reportInitError(e, st);
+          }),
         );
-      }).catchError((Object _) {}),
+      }).catchError((Object e, StackTrace st) {
+        _reportInitError(e, st);
+      }),
     );
 
     // Load registries once here, not on every tab visit. Honour the
     // ianaSource privacy choice: bundled snapshot, online fetch, or off.
     unawaited(
-      configuratorController.loadRegistries(
-        source: settingsController.settings.ianaSource,
-      ).catchError((Object _) {}),
+      configuratorController
+          .loadRegistries(source: settingsController.settings.ianaSource)
+          .catchError((Object e, StackTrace st) {
+            _reportInitError(e, st);
+          }),
     );
   }
 

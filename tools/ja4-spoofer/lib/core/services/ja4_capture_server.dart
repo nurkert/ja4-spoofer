@@ -74,8 +74,8 @@ class Ja4CaptureServer {
   }
 
   void dispose() {
-    stop();
-    _controller.close();
+    unawaited(stop());
+    unawaited(_controller.close());
   }
 
   // ---------------------------------------------------------------------------
@@ -135,16 +135,16 @@ class Ja4CaptureServer {
         if (buf.length >= 5 && buf[0] == 0x16) {
           final recordLen = (buf[3] << 8) | buf[4];
           if (buf.length >= 5 + recordLen) {
-            sub.cancel();
+            unawaited(sub.cancel());
             complete(Uint8List.fromList(buf));
           }
         } else if (buf.isNotEmpty && buf[0] != 0x16) {
-          sub.cancel();
+          unawaited(sub.cancel());
           complete(null);
         }
       },
       onError: (_) {
-        sub.cancel();
+        unawaited(sub.cancel());
         complete(null);
       },
       onDone: () {
@@ -153,7 +153,7 @@ class Ja4CaptureServer {
     );
 
     timer = Timer(const Duration(seconds: 3), () {
-      sub.cancel();
+      unawaited(sub.cancel());
       complete(buf.isNotEmpty ? Uint8List.fromList(buf) : null);
     });
 

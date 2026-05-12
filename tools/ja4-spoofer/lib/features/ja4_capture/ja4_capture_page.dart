@@ -5,7 +5,9 @@ import 'package:flutter/services.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
 import '../../app/widgets/section_card.dart';
+import '../../app/widgets/settings_scope.dart';
 import '../../core/controllers/profile_catalog_controller.dart';
+import '../../core/models/app_settings.dart';
 import '../../core/models/capture_record.dart';
 import '../../core/models/fingerprint_profile.dart';
 import '../../core/models/registry_bundle.dart';
@@ -22,6 +24,7 @@ class Ja4CapturePage extends StatefulWidget {
 
 class _Ja4CapturePageState extends State<Ja4CapturePage> {
   late final Ja4CaptureController _controller;
+  IanaSource? _lastIanaSource;
 
   @override
   void initState() {
@@ -29,6 +32,21 @@ class _Ja4CapturePageState extends State<Ja4CapturePage> {
     _controller = Ja4CaptureController(
       profileCatalogController: widget.profileCatalogController,
     );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // SettingsScope is an InheritedNotifier — reading it here subscribes the
+    // page to its changes. When the user toggles `ianaSource` in Settings,
+    // didChangeDependencies fires and we ask the capture controller to
+    // re-load its registry under the new source instead of going stale.
+    final settings = SettingsScope.maybeOf(context)?.settings;
+    if (settings == null) return;
+    if (_lastIanaSource != null && _lastIanaSource != settings.ianaSource) {
+      unawaited(_controller.refreshSettings());
+    }
+    _lastIanaSource = settings.ianaSource;
   }
 
   @override
@@ -68,9 +86,11 @@ class _Ja4CapturePageState extends State<Ja4CapturePage> {
           ShadButton.outline(
             onPressed: running
                 ? () {
-                    Clipboard.setData(
-                      ClipboardData(
-                        text: 'https://localhost:${_controller.port}',
+                    unawaited(
+                      Clipboard.setData(
+                        ClipboardData(
+                          text: 'https://localhost:${_controller.port}',
+                        ),
                       ),
                     );
                   }
@@ -142,7 +162,7 @@ class _CaptureRowState extends State<_CaptureRow> {
     final versionCtrl = TextEditingController();
     final iconUrlCtrl = TextEditingController();
 
-    showShadDialog(
+    unawaited(showShadDialog(
       context: context,
       builder: (dialogContext) => ShadDialog(
         title: const Text('Save Capture as Profile'),
@@ -202,7 +222,7 @@ class _CaptureRowState extends State<_CaptureRow> {
           ],
         ),
       ),
-    );
+    ));
   }
 
   @override

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
@@ -323,7 +325,7 @@ class _RequirementsInfoButton extends StatelessWidget {
         .where((r) => r.name.trim().isNotEmpty)
         .toList(growable: false);
 
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (_) => AlertDialog(
         title: const Text('Build Requirements', style: TextStyle(fontSize: 15)),
@@ -388,7 +390,7 @@ class _RequirementsInfoButton extends StatelessWidget {
           ),
         ],
       ),
-    );
+    ));
   }
 
   @override

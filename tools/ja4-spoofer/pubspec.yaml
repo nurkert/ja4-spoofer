@@ -2,7 +2,7 @@ name: ja4_spoofer
 description: "Desktop GUI for building and launching apps with configurable JA4 TLS fingerprints."
 publish_to: 'none'
 
-version: 1.2.0+1
+version: 1.3.0+1
 
 environment:
   sdk: ^3.10.8

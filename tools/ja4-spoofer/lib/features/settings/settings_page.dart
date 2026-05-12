@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
@@ -40,9 +42,9 @@ class _SettingsPageState extends State<SettingsPage> {
     // a markNeedsBuild to SettingsScope ancestors mid-build.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _controller.load().then((_) {
+      unawaited(_controller.load().then((_) {
         if (mounted) _syncTextFields();
-      });
+      }));
     });
   }
 

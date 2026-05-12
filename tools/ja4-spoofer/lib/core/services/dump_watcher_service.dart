@@ -31,7 +31,7 @@ class DumpWatcherService {
 
   void dispose() {
     stop();
-    _controller.close();
+    unawaited(_controller.close());
   }
 
   Future<void> _poll(String path) async {

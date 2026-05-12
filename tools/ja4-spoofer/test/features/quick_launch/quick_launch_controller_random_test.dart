@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -119,7 +120,7 @@ void main() {
 
     test('clears compat probe results on a new roll', () async {
       qlc.roll();
-      qlc.scheduleCompatProbe('firefox');
+      unawaited(qlc.scheduleCompatProbe('firefox'));
       qlc.roll();
       expect(qlc.compatFor('firefox'), isNull);
     });
