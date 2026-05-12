@@ -42,6 +42,10 @@ if [[ "${BUILD_NUMBER}" == "${PUBSPEC_VERSION}" ]]; then
   BUILD_NUMBER="1"
 fi
 DESCRIPTION=$(awk '/^description:/ {sub(/^description:[[:space:]]*"?/, ""); sub(/"?[[:space:]]*$/, ""); print}' pubspec.yaml)
+# Sanitize for the .deb control file: it requires a single-line synopsis on
+# `Description:` and disallows raw newlines / leading whitespace. Strip
+# anything that would corrupt the format.
+DESCRIPTION=$(printf '%s' "$DESCRIPTION" | tr -d '\r' | tr '\n\t' '  ' | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//')
 
 NO_BUILD=0
 NO_SYNC=0

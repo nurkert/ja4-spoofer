@@ -18,6 +18,12 @@ on:
 permissions:
   contents: write
 
+env:
+  # Made available so steps can test `if: env.GPG_PRIVATE_KEY != ''`.
+  # Empty if the secret isn't configured — signing then skips gracefully.
+  GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+  GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
 jobs:
   build:
     name: Build Linux .deb (amd64)
@@ -36,7 +42,7 @@ jobs:
             apt-get update && \
             apt-get install -y --no-install-recommends --fix-missing \
               git curl ca-certificates xz-utils unzip sudo rsync \
-              perl jq && break
+              perl jq gnupg && break
             echo "apt attempt $i failed, retrying..."
             sleep 5
           done
@@ -86,11 +92,137 @@ jobs:
           fi
 
           TAG="v$VERSION"
-          echo "VERSION=$VERSION"           >> "$GITHUB_ENV"
-          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
-          echo "TAG=$TAG"                   >> "$GITHUB_ENV"
+          {
+            echo "VERSION=$VERSION"
+            echo "BUILD_NUMBER=$BUILD_NUMBER"
+            echo "TAG=$TAG"
+          } >> "$GITHUB_ENV"
 
-      - name: Bump pubspec version and tag
+      - name: Read pinned Flutter version
+        id: flutter_version
+        shell: bash
+        run: |
+          version=$(tr -d '[:space:]' < tools/ja4-spoofer/.flutter-version)
+          if [[ -z "$version" ]]; then
+            echo "::error::tools/ja4-spoofer/.flutter-version is empty"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Flutter SDK
+        id: cache_flutter
+        uses: actions/cache@v4
+        with:
+          path: /root/flutter
+          key: flutter-sdk-${{ steps.flutter_version.outputs.version }}-bullseye
+
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: /root/.pub-cache
+          key: pub-cache-${{ steps.flutter_version.outputs.version }}-${{ hashFiles('tools/ja4-spoofer/pubspec.lock') }}
+          restore-keys: |
+            pub-cache-${{ steps.flutter_version.outputs.version }}-
+
+      - name: Install Flutter
+        if: steps.cache_flutter.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone --depth 1 \
+            --branch "${{ steps.flutter_version.outputs.version }}" \
+            https://github.com/flutter/flutter.git /root/flutter
+
+      - name: Configure Flutter
+        shell: bash
+        run: |
+          echo "/root/flutter/bin" >> "$GITHUB_PATH"
+          /root/flutter/bin/flutter --version
+          /root/flutter/bin/flutter config --enable-linux-desktop
+
+      - name: Sync bundled-runtime assets from repo root
+        run: bash tools/ja4-spoofer/scripts/sync_bundled_runtime.sh
+
+      - name: Install build dependencies
+        run: |
+          set -e
+          # Flutter's native_assets toolchain expects the full LLVM tool
+          # set (clang, ld.lld, llvm-ar, llvm-nm, llvm-strip, ...) next to
+          # clang-11. clang, lld and llvm together cover them all.
+          for i in 1 2 3; do
+            apt-get update && \
+            apt-get install -y --no-install-recommends --fix-missing \
+              clang lld llvm cmake ninja-build pkg-config \
+              libgtk-3-dev liblzma-dev dpkg-dev libstdc++-10-dev && break
+            echo "apt attempt $i failed, retrying..."
+            sleep 5
+          done
+
+      - name: Flutter pub get
+        working-directory: tools/ja4-spoofer
+        run: flutter pub get
+
+      - name: Build .deb
+        shell: bash
+        run: |
+          bash tools/ja4-spoofer/scripts/package_linux_deb.sh \
+            --no-sync \
+            --version      "$VERSION" \
+            --build-number "$BUILD_NUMBER"
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        working-directory: tools/ja4-spoofer/dist
+        run: |
+          set -euo pipefail
+          : > SHA256SUMS
+          for f in *.deb; do
+            sha256sum "$f" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+
+      - name: Import GPG signing key
+        id: gpg
+        if: env.GPG_PRIVATE_KEY != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --yes --import
+          KEY_ID=$(gpg --list-secret-keys --keyid-format=long --with-colons \
+            | awk -F: '/^sec:/ {print $5; exit}')
+          if [[ -z "$KEY_ID" ]]; then
+            echo "::error::no secret key imported"
+            exit 1
+          fi
+          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Sign .deb and SHA256SUMS
+        if: steps.gpg.outputs.available == 'true'
+        shell: bash
+        working-directory: tools/ja4-spoofer/dist
+        run: |
+          set -euo pipefail
+          for f in *.deb SHA256SUMS; do
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$GPG_PASSPHRASE" \
+              --local-user "${{ steps.gpg.outputs.key_id }}" \
+              --detach-sign --armor \
+              --output "${f}.asc" "$f"
+          done
+          ls -la *.asc
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ja4-spoofer-${{ env.VERSION }}-linux-amd64
+          path: |
+            tools/ja4-spoofer/dist/*.deb
+            tools/ja4-spoofer/dist/*.asc
+            tools/ja4-spoofer/dist/SHA256SUMS
+          retention-days: 30
+
+      - name: Bump pubspec and push release commit
+        id: bump
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
@@ -108,72 +240,43 @@ jobs:
             git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
               "HEAD:${GITHUB_REF_NAME}"
           fi
-
-          git tag -a "$TAG" -m "Release $TAG"
-          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
-            "$TAG"
-
-      - name: Sync bundled-runtime assets from repo root
-        run: bash tools/ja4-spoofer/scripts/sync_bundled_runtime.sh
-
-      - name: Install build dependencies
-        run: |
-          set -e
-          # Flutter's native_assets toolchain expects the full LLVM tool
-          # set (clang, ld.lld, llvm-ar, llvm-nm, llvm-strip, ...) next to
-          # clang-11. clang, lld and llvm together cover them all.
-          for i in 1 2 3; do
-            apt-get install -y --no-install-recommends --fix-missing \
-              clang lld llvm cmake ninja-build pkg-config \
-              libgtk-3-dev liblzma-dev dpkg-dev libstdc++-10-dev && break
-            echo "apt attempt $i failed, retrying..."
-            sleep 5
-          done
-
-      - name: Install Flutter
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/flutter/flutter.git -b stable "$HOME/flutter"
-          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
-          "$HOME/flutter/bin/flutter" --version
-          "$HOME/flutter/bin/flutter" config --enable-linux-desktop
-
-      - name: Flutter pub get
-        working-directory: tools/ja4-spoofer
-        run: flutter pub get
-
-      - name: Build .deb
-        shell: bash
-        run: |
-          bash tools/ja4-spoofer/scripts/package_linux_deb.sh \
-            --no-sync \
-            --version      "$VERSION" \
-            --build-number "$BUILD_NUMBER"
-
-      - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ja4-spoofer-${{ env.VERSION }}-linux-amd64
-          path: tools/ja4-spoofer/dist/*.deb
-          retention-days: 30
+          # Carry the post-bump commit hash so the release-create step
+          # creates the tag at the right commit (not at github.sha).
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ env.TAG }}
+          commit: ${{ steps.bump.outputs.commit || github.sha }}
           name: JA4 Spoofer ${{ env.TAG }}
-          artifacts: tools/ja4-spoofer/dist/*.deb
+          artifacts: tools/ja4-spoofer/dist/*.deb,tools/ja4-spoofer/dist/*.asc,tools/ja4-spoofer/dist/SHA256SUMS
           artifactErrorsFailBuild: true
           allowUpdates: true
           makeLatest: true
+          generateReleaseNotes: true
           body: |
-            Install on Debian/Ubuntu:
+            ## Install
+
+            APT (recommended):
+
+            ```bash
+            sudo apt update && sudo apt install ja4-spoofer
+            ```
+
+            Direct download:
 
             ```bash
             sudo dpkg -i ja4-spoofer_*.deb
             sudo apt-get install -f   # resolves any missing deps
             ```
 
-            Then launch with `ja4-spoofer` or from the applications menu.
+            Verify the artifact:
+
+            ```bash
+            sha256sum -c SHA256SUMS
+            gpg --verify ja4-spoofer_*.deb.asc ja4-spoofer_*.deb   # if signed
+            ```
+
             On first launch the app extracts its scripts, configs and patches to
-            `~/.ja4-spoofer/runtime/<version>/` — no repository checkout needed.
+            `~/.ja4-spoofer/runtime/<version>/`. No repository checkout needed.
