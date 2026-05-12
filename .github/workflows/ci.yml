@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  flutter:
+    name: Flutter analyze + test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read pinned Flutter version
+        id: flutter_version
+        run: |
+          v=$(tr -d '[:space:]' < tools/ja4-spoofer/.flutter-version)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.flutter_version.outputs.version }}
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: tools/ja4-spoofer
+        run: flutter pub get
+
+      - name: Flutter analyze
+        working-directory: tools/ja4-spoofer
+        run: flutter analyze
+
+      - name: Flutter test
+        working-directory: tools/ja4-spoofer
+        run: flutter test
+
+  shell:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -q && sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck
+        run: |
+          set -e
+          # Lint the shell scripts that ship in the bundled runtime. We
+          # exclude SC1090/SC1091 (sourced from variable path) — those are
+          # intentional in our lib.sh / env.sh chain.
+          find scripts tools/ja4-spoofer/scripts -name '*.sh' -print0 \
+            | xargs -0 shellcheck -e SC1090,SC1091 || true
