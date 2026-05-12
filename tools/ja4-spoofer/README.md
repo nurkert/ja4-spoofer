@@ -1,6 +1,6 @@
 # JA4 Spoofer — Flutter Desktop GUI
 
-Desktop GUI for controlled JA4 fingerprint experiments with Chromium, Brave-style builds, Firefox and curl. It patches the underlying SSL libraries (BoringSSL, NSS, OpenSSL), builds the apps, and launches them with a configured JA4 profile.
+Desktop GUI for controlled JA4 fingerprint experiments with Chromium, Firefox and curl. It patches the underlying SSL libraries (BoringSSL, NSS, OpenSSL), builds the apps, and launches them with a configured JA4 profile. Bundled seed profiles cover additional clients (Safari, Brave, Tor, Zen, Apple Mail) for replay; those are spoofed via the patched Chromium pipeline rather than separate builds.
 
 ## Quickstart
 
@@ -67,7 +67,6 @@ This means a `git pull` that touches patches, lying logic, build flags, toolchai
 | App         | SSL lib     | Build script                                |
 |-------------|-------------|---------------------------------------------|
 | Chromium    | BoringSSL   | `build_chromium_with_patched_boringssl.sh`  |
-| Brave       | BoringSSL   | (Chromium build pipeline)                   |
 | Firefox     | NSS         | `build_firefox_with_patched_nss.sh`         |
 | curl        | OpenSSL     | `build_curl_with_openssl.sh`                |
 
@@ -86,7 +85,7 @@ High-level summary:
 | App                  | Needs                                                                        |
 |----------------------|------------------------------------------------------------------------------|
 | Firefox              | Xcode CLT, `bash >= 4`, `python <= 3.12`, `mercurial`, `git`. `mach bootstrap` is auto-run on first build and pulls clang + Rust + SDK into `~/.mozbuild/`. |
-| Chromium / Brave     | Xcode CLT, `depot_tools` on `$PATH`, `cmake`, `bash >= 4`, `python <= 3.12`, `git`. `gn` and `ninja` come with depot_tools. |
+| Chromium             | Xcode CLT, `depot_tools` on `$PATH`, `cmake`, `bash >= 4`, `python <= 3.12`, `git`. `gn` and `ninja` come with depot_tools. |
 | curl (OpenSSL)       | `cc`, `make`, `perl`, `tar`, `curl`, `git` — all standard CLT/`build-essential` packages. |
 
 Disk: ~80 GB for the full Chromium tree, ~25 GB for Firefox, <2 GB for curl/OpenSSL.

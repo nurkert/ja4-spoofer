@@ -1,0 +1,84 @@
+# Changelog
+
+All notable changes to JA4 Spoofer are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.3.0] — 2026-05-12
+
+### Added
+
+- `AppShell._initControllers` now uses a re-entry guard so rapid Settings
+  saves no longer race two concurrent init passes against the same
+  controllers.
+- Init failures and background load failures surface as destructive
+  `ShadSonner` toasts instead of being swallowed by `unawaited(...)`.
+- `Ja4CaptureController` reacts to `SettingsScope` changes via
+  `didChangeDependencies`, so an IANA-source toggle hot-reloads the
+  registry without leaving the capture page.
+
+### Changed
+
+- `analysis_options.yaml` promotes `unawaited_futures` and
+  `discarded_futures` to errors. All ~20 violations were either awaited
+  or explicitly wrapped in `unawaited(...)`.
+
+## [1.2.0] — 2026-05-12
+
+### Added
+
+- Release pipeline pins the Flutter SDK via
+  `tools/ja4-spoofer/.flutter-version` and caches `$HOME/flutter` plus
+  `~/.pub-cache` across runs.
+- Each release artifact ships with a `SHA256SUMS` file. The workflow also
+  signs `.deb` + `SHA256SUMS` with GPG when `GPG_PRIVATE_KEY` /
+  `GPG_PASSPHRASE` repo secrets are configured.
+- Release notes are generated from the git log via
+  `ncipollo/release-action`'s `generateReleaseNotes`.
+
+### Changed
+
+- The pubspec bump and tag push now happen *after* a successful build, so
+  a failed build no longer leaves an orphan tag pointing at broken code.
+- `package_linux_deb.sh` strips newlines and surrounding whitespace from
+  the pubspec description before embedding it in `DEBIAN/control` to
+  keep the field on a single line.
+
+## [1.1.0] — 2026-05-12
+
+### Fixed
+
+- `scripts/lib/util.sh` — `load_env_config` no longer evaluates command
+  substitution from config files. A line like `FOO=$(rm -rf ~)` is now
+  treated as literal text (and rejected). The new parser keeps the only
+  expansion that was actually used (`~/` → `$HOME/`).
+- `scripts/apply_patches.sh` — re-running with unique commits on
+  `my-changes` no longer silently destroys WIP. The script now aborts
+  unless `--force` is passed.
+- `scripts/build_firefox_with_patched_nss.sh` — `git clean -fd` is gated
+  to ja4-managed checkouts via a `.ja4-managed-checkout` marker, so a
+  stray `--workdir` pointing at a developer's own gecko-dev cannot wipe
+  their tree.
+- `AppLauncherController.smartLaunch` serializes apps sharing the same
+  `submoduleName` via a per-submodule mutex, preventing concurrent
+  patch runs from corrupting `libs/<sub>`.
+
+## [1.0.0] — 2026-05-12
+
+Initial public release.
+
+- Patch workflows for BoringSSL, NSS, and OpenSSL.
+- Flutter desktop GUI (`tools/ja4-spoofer/`) for profile editing, capture,
+  randomization, and one-click launch.
+- Bundled-runtime model — packaged installs extract scripts/configs/
+  patches to `~/.ja4-spoofer/runtime/<version>/` on first launch, no
+  repo checkout needed.
+- GitHub Actions release pipeline that builds a `.deb` against
+  `debian:bullseye-slim` for glibc 2.31 compatibility.
+- Seed profiles for Safari, Brave, Tor, Zen, Apple Mail, curl, Chromium,
+  Firefox.
+
+[1.3.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.3.0
+[1.2.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.2.0
+[1.1.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.1.0
+[1.0.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.0.0

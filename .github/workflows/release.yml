@@ -221,6 +221,22 @@ jobs:
             tools/ja4-spoofer/dist/SHA256SUMS
           retention-days: 30
 
+      - name: Compute release artifact list
+        id: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ncipollo with artifactErrorsFailBuild=true fails when a glob
+          # matches zero files. Without GPG_PRIVATE_KEY no .asc exists, so
+          # we enumerate what's actually on disk.
+          mapfile -t files < <(find tools/ja4-spoofer/dist -maxdepth 1 \
+            \( -name '*.deb' -o -name '*.asc' -o -name 'SHA256SUMS' \) | sort)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::no release artifacts found in dist/"
+            exit 1
+          fi
+          (IFS=,; echo "list=${files[*]}") >> "$GITHUB_OUTPUT"
+
       - name: Bump pubspec and push release commit
         id: bump
         if: github.event_name == 'workflow_dispatch'
@@ -250,7 +266,7 @@ jobs:
           tag: ${{ env.TAG }}
           commit: ${{ steps.bump.outputs.commit || github.sha }}
           name: JA4 Spoofer ${{ env.TAG }}
-          artifacts: tools/ja4-spoofer/dist/*.deb,tools/ja4-spoofer/dist/*.asc,tools/ja4-spoofer/dist/SHA256SUMS
+          artifacts: ${{ steps.artifacts.outputs.list }}
           artifactErrorsFailBuild: true
           allowUpdates: true
           makeLatest: true

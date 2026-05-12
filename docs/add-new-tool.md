@@ -129,8 +129,10 @@ need additional Flutter UI code.
 If `launch.profile_format` is not one of the existing values, update:
 
 - `tools/ja4-spoofer/lib/features/app_launcher/app_launcher_controller.dart`
-- `tools/ja4-spoofer/lib/core/services/patch_service.dart`
-- `tools/ja4-spoofer/lib/features/patch_manager/patch_manager_controller.dart`
+  — extend the `submoduleName` switch in `AppState` and the profile-args
+  mapping in `_profileArgsForApp`.
+- `tools/ja4-spoofer/lib/core/services/patch_service.dart` — extend the
+  submodule list so the patch-stamp check covers the new stack.
 
 Without these mappings, patch status, patch application and build buttons cannot
 work correctly for the new stack.

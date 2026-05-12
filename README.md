@@ -4,6 +4,10 @@
 
 # JA4 Spoofer
 
+[![Release](https://github.com/nurkert/ja4-spoofer/actions/workflows/release.yml/badge.svg)](https://github.com/nurkert/ja4-spoofer/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/nurkert/ja4-spoofer)](https://github.com/nurkert/ja4-spoofer/releases)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
 JA4 Spoofer is an open-source toolkit for controlled TLS ClientHello and JA4
 fingerprint experiments. It patches common TLS stacks, builds client
 applications against those patched stacks, and launches them with explicit
@@ -13,7 +17,7 @@ The project currently targets:
 
 | Client | TLS stack | Status |
 |---|---|---|
-| Chromium / Brave-style builds | BoringSSL | Patched via `patches/boringssl/` |
+| Chromium | BoringSSL | Patched via `patches/boringssl/` |
 | Firefox | NSS | Patched via `patches/nss/` |
 | curl / OpenSSL CLI paths | OpenSSL | Patched via `patches/openssl/` |
 
@@ -79,31 +83,28 @@ flutter pub get
 flutter build linux --release
 ```
 
-The resulting binary will be located at:
-
-```text
-build/linux/x64/release/bundle/ja4_spoofer
-```
-
-To make `ja4_spoofer` globally accessible from your terminal (e.g., just by
-typing `ja4_spoofer`), you can do one of the following:
+The resulting binary file is at `build/linux/x64/release/bundle/ja4_spoofer`.
+The filename uses an underscore because that is the Dart package name; the
+APT package exposes it under the hyphenated `ja4-spoofer` command via a
+launcher in `/usr/bin/`. For a manual build, mirror the same convention by
+symlinking with the hyphenated name:
 
 - **Option 1: Create a symbolic link**
 
   ```bash
-  sudo ln -s "$(pwd)/build/linux/x64/release/bundle/ja4_spoofer" /usr/local/bin/ja4_spoofer
+  sudo ln -s "$(pwd)/build/linux/x64/release/bundle/ja4_spoofer" /usr/local/bin/ja4-spoofer
   ```
 
 - **Option 2: Copy the binary into a directory in your `$PATH`**
 
   ```bash
-  sudo cp build/linux/x64/release/bundle/ja4_spoofer /usr/local/bin/
+  sudo cp build/linux/x64/release/bundle/ja4_spoofer /usr/local/bin/ja4-spoofer
   ```
 
 Now you can launch the application simply by typing:
 
 ```bash
-ja4_spoofer
+ja4-spoofer
 ```
 
 ### Create a Debian package

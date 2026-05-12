@@ -16,13 +16,14 @@ scripts/refresh_patches.sh
 
 This exports commit patches into `patches/<lib>/`.
 
-Optional: export ungecommitete Submodule-Diffs zusätzlich:
+To also export uncommitted submodule diffs alongside the patches:
 
 ```bash
 scripts/refresh_patches.sh --include-wip
 ```
 
-Dann werden zusätzlich `.diff`-Dateien geschrieben:
+That additionally writes `.diff` files:
+
 - `9998-wip-working-tree.diff`
 - `9999-wip-index.diff`
 
@@ -40,11 +41,14 @@ git submodule update --init --remote
 scripts/apply_patches.sh
 ```
 
-Optional: zusätzlich `.diff`-Snapshots anwenden:
+To also apply the `.diff` WIP snapshots on top:
 
 ```bash
 scripts/apply_patches.sh --with-wip
 ```
+
+The script aborts if `my-changes` carries commits beyond the current patch
+set or has a dirty working tree — pass `--force` to override.
 
 If a patch fails, fix conflicts inside the submodule and re-run
 `scripts/refresh_patches.sh` to update the patch set.
