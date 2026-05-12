@@ -114,23 +114,7 @@ jobs:
             "$TAG"
 
       - name: Sync bundled-runtime assets from repo root
-        shell: bash
-        run: |
-          set -euo pipefail
-          DEST="tools/ja4-spoofer/assets/bundled-runtime"
-
-          rsync -a --delete \
-            --exclude='__pycache__' --exclude='*.pyc' \
-            scripts/ "$DEST/scripts/"
-
-          rsync -a --delete configs/ "$DEST/configs/"
-
-          for lib in boringssl nss openssl; do
-            mkdir -p "$DEST/patches/$lib"
-            rsync -a --delete \
-              --include='*.patch' --include='BASE_REF' --exclude='*' \
-              "patches/$lib/" "$DEST/patches/$lib/"
-          done
+        run: bash tools/ja4-spoofer/scripts/sync_bundled_runtime.sh
 
       - name: Install build dependencies
         run: |
@@ -162,6 +146,7 @@ jobs:
         shell: bash
         run: |
           bash tools/ja4-spoofer/scripts/package_linux_deb.sh \
+            --no-sync \
             --version      "$VERSION" \
             --build-number "$BUILD_NUMBER"
 

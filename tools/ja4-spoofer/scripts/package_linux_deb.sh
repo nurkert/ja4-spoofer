@@ -12,10 +12,11 @@
 #   - dpkg-deb (Debian/Ubuntu/derivates)
 #
 # Usage:
-#   scripts/package_linux_deb.sh [--no-build] [--arch <amd64|arm64>] [--version X.Y.Z] [--build-number N]
+#   scripts/package_linux_deb.sh [--no-build] [--no-sync] [--arch <amd64|arm64>] [--version X.Y.Z] [--build-number N]
 #
 #   --no-build   Skip `flutter build linux --release` and reuse the existing
 #                build artifact.
+#   --no-sync    Skip the bundled-runtime asset sync from repo root.
 #   --arch       Override architecture string in the .deb filename and control
 #                file. Defaults to the host's `dpkg --print-architecture`.
 #   --version    Override the pubspec version for the .deb metadata.
@@ -43,11 +44,16 @@ fi
 DESCRIPTION=$(awk '/^description:/ {sub(/^description:[[:space:]]*"?/, ""); sub(/"?[[:space:]]*$/, ""); print}' pubspec.yaml)
 
 NO_BUILD=0
+NO_SYNC=0
 ARCH=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-build)
       NO_BUILD=1
+      shift
+      ;;
+    --no-sync)
+      NO_SYNC=1
       shift
       ;;
     --arch)
@@ -120,6 +126,12 @@ case "${ARCH}" in
 esac
 
 DEB_VERSION="${VERSION}-${BUILD_NUMBER}"
+
+if [[ "${NO_SYNC}" -eq 0 ]]; then
+  bash "$(dirname "${SCRIPT_PATH}")/sync_bundled_runtime.sh"
+else
+  echo "[info] --no-sync set; using existing assets/bundled-runtime/"
+fi
 
 if [[ "${NO_BUILD}" -eq 0 ]]; then
   echo "[info] flutter build linux --release ..."

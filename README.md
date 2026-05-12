@@ -108,14 +108,18 @@ ja4_spoofer
 
 ### Create a Debian package
 
-The repository ships with a helper script that bundles the application into a
-`.deb` file. Run it from the project root and then install the resulting
-package with `dpkg`:
+The repository ships with a helper script that synchronises the bundled
+runtime assets (scripts, configs, patches), runs `flutter build linux`, and
+packs everything into a `.deb` in a single command. Run it from the project
+root and then install the resulting package with `dpkg`:
 
 ```bash
 bash tools/ja4-spoofer/scripts/package_linux_deb.sh
 sudo dpkg -i tools/ja4-spoofer/dist/ja4-spoofer_*_$(dpkg --print-architecture).deb
 ```
+
+Pass `--no-build` to repackage without rebuilding, or `--no-sync` to skip the
+asset sync step (e.g. when the CI has already done it).
 
 After installation the `ja4-spoofer` command is available globally. To remove
 the package again:

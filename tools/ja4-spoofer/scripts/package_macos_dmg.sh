@@ -9,11 +9,12 @@
 # required, uses macOS' built-in hdiutil.
 #
 # Usage:
-#   scripts/package_macos_dmg.sh [--no-build]
+#   scripts/package_macos_dmg.sh [--no-build] [--no-sync]
 #
 #   --no-build   Skip `flutter build macos --release` and reuse the existing
 #                build artifact. Useful for fast iteration on the packaging
 #                step.
+#   --no-sync    Skip the bundled-runtime asset sync from repo root.
 
 set -euo pipefail
 
@@ -31,9 +32,11 @@ DMG_VOLUME_NAME="JA4 Spoofer ${VERSION}"
 DMG_FILE="${DIST_DIR}/${APP_NAME}-${VERSION}-macos.dmg"
 
 NO_BUILD=0
+NO_SYNC=0
 for arg in "$@"; do
   case "${arg}" in
     --no-build) NO_BUILD=1 ;;
+    --no-sync) NO_SYNC=1 ;;
     -h|--help)
       sed -n '1,/^set -euo pipefail/p' "$SCRIPT_PATH" | sed -n '/^#/p'
       exit 0
@@ -48,6 +51,12 @@ done
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "[error] this script must run on macOS" >&2
   exit 1
+fi
+
+if [[ "${NO_SYNC}" -eq 0 ]]; then
+  bash "$(dirname "${SCRIPT_PATH}")/sync_bundled_runtime.sh"
+else
+  echo "[info] --no-sync set; using existing assets/bundled-runtime/"
 fi
 
 if [[ "${NO_BUILD}" -eq 0 ]]; then
