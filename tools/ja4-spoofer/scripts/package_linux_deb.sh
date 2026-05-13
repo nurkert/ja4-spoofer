@@ -133,8 +133,21 @@ DEB_VERSION="${VERSION}-${BUILD_NUMBER}"
 
 if [[ "${NO_SYNC}" -eq 0 ]]; then
   bash "$(dirname "${SCRIPT_PATH}")/sync_bundled_runtime.sh"
+  # Keep the Linux runner window icon in lock-step with assets/icon.png.
+  # flutter_launcher_icons does not regenerate it for Linux, so without this
+  # call the bundled window icon drifts whenever the asset is updated.
+  if command -v python3 >/dev/null 2>&1; then
+    # Don't fail packaging if Pillow is missing on this builder — only warn.
+    # The icon will simply remain whatever is committed under
+    # linux/runner/resources/app_icon.png.
+    if ! python3 "$(dirname "${SCRIPT_PATH}")/sync_app_icon.py"; then
+      echo "[warn] app icon sync failed — window icon may be stale" >&2
+    fi
+  else
+    echo "[warn] python3 not found — skipping app icon sync (window icon may be stale)"
+  fi
 else
-  echo "[info] --no-sync set; using existing assets/bundled-runtime/"
+  echo "[info] --no-sync set; using existing assets/bundled-runtime/ and runner icons"
 fi
 
 if [[ "${NO_BUILD}" -eq 0 ]]; then

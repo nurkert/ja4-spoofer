@@ -101,9 +101,16 @@ tar -xzf "$TARBALL" -C "$SOURCE_DIR" --strip-components=1
 
 cd "$SOURCE_DIR"
 
-export PKG_CONFIG_PATH="$OPENSSL_INSTALL_DIR/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+# OpenSSL Configure lands in lib/ or lib64/ depending on host distro; pick the
+# real path so dependent pkg-config / linker flags do not point at a missing
+# directory.
+if ! OPENSSL_LIBDIR="$(resolve_install_libdir "$OPENSSL_INSTALL_DIR")"; then
+  echo "[error] OpenSSL build not found at $OPENSSL_INSTALL_DIR (looked for lib/ and lib64/) — run scripts/build_openssl.sh first" >&2
+  exit 1
+fi
+export PKG_CONFIG_PATH="$OPENSSL_LIBDIR/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export CPPFLAGS="-I$OPENSSL_INSTALL_DIR/include${CPPFLAGS:+ $CPPFLAGS}"
-export LDFLAGS="-L$OPENSSL_INSTALL_DIR/lib${LDFLAGS:+ $LDFLAGS}"
+export LDFLAGS="-L$OPENSSL_LIBDIR${LDFLAGS:+ $LDFLAGS}"
 
 echo "[info] configuring curl..."
 ./configure \

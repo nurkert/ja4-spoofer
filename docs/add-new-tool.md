@@ -119,6 +119,34 @@ must end up in `JA4_BROWSER_EXTRA_ARGS`. When
 `pass_user_args_after_double_dash: true` is set, the launcher passes `--` and
 the raw user arguments to the script.
 
+### Linking a New CLI Against the Patched OpenSSL
+
+OpenSSL's `Configure` lands the install in `install/lib/` on some hosts
+(macOS, Arch) and `install/lib64/` on others (Debian/Ubuntu on x86_64).
+`scripts/build_openssl.sh` now pins `--libdir=lib`, but pre-existing builds
+on contributor machines may still be `lib64`-shaped. Never hardcode either
+path — use the `resolve_install_libdir` helper from `scripts/lib/util.sh`:
+
+```bash
+source "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/util.sh"
+
+INSTALL_DIR="$HOME/build/openssl-ja4-standalone/install"
+if ! OPENSSL_LIBDIR="$(resolve_install_libdir "$INSTALL_DIR")"; then
+  echo "[error] patched OpenSSL not found — run scripts/build_openssl.sh" >&2
+  exit 1
+fi
+
+export PKG_CONFIG_PATH="$OPENSSL_LIBDIR/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export LDFLAGS="-L$OPENSSL_LIBDIR${LDFLAGS:+ $LDFLAGS}"
+# At launch time, also export LD_LIBRARY_PATH / DYLD_LIBRARY_PATH using the
+# same OPENSSL_LIBDIR — see scripts/run_curl_with_ja4.sh for the pattern.
+```
+
+Chromium and Firefox don't need this: their patched TLS stacks (BoringSSL and
+NSS respectively) are linked statically into the browser binary, so no
+runtime library path is required.
+
 ## 4. Avoid UI Hardcoding
 
 The GUI discovers apps from descriptors. A normal tool integration should not

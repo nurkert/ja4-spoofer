@@ -79,8 +79,8 @@ done
 parse_ja4_args "${remaining_args[@]+"${remaining_args[@]}"}"
 
 INSTALL_DIR="$BUILD_DIR/install"
-if [[ ! -d "$INSTALL_DIR/lib" ]]; then
-  echo "[error] OpenSSL build not found at $INSTALL_DIR — run scripts/build_openssl.sh first" >&2
+if ! OPENSSL_LIBDIR="$(resolve_install_libdir "$INSTALL_DIR")"; then
+  echo "[error] OpenSSL build not found at $INSTALL_DIR (looked for lib/ and lib64/) — run scripts/build_openssl.sh first" >&2
   exit 1
 fi
 
@@ -92,9 +92,9 @@ if [[ "$JA4_SHOW_CONFIG" -eq 1 ]]; then
 fi
 
 if [[ $IS_MACOS -eq 1 ]]; then
-  export DYLD_LIBRARY_PATH="$INSTALL_DIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+  export DYLD_LIBRARY_PATH="$OPENSSL_LIBDIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 else
-  export LD_LIBRARY_PATH="$INSTALL_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$OPENSSL_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
 export OPENSSL_JA4_CONFIG="$config_out"

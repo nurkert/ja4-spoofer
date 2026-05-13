@@ -52,7 +52,7 @@ Every launcher accepts the flags documented in
 
 | Script | Purpose |
 |---|---|
-| `lib.sh`, `lib/env.sh`, `lib/util.sh`, `lib/parse_ja4_args.sh`, `lib/process.sh` | Sourced by the other scripts. `util.sh` exposes the safe `load_env_config` parser, the `retry` helper, and `cleanup_git_locks`. |
+| `lib.sh`, `lib/env.sh`, `lib/util.sh`, `lib/parse_ja4_args.sh`, `lib/process.sh` | Sourced by the other scripts. `util.sh` exposes the safe `load_env_config` parser, the `retry` helper, `cleanup_git_locks`, and `resolve_install_libdir` (picks `install/lib` vs `install/lib64` so any OpenSSL‑backed client works regardless of host). |
 | `browsers/*.sh` | Per-browser overrides for the shared launcher. |
 | `analyze_ja3.py` | Analyse JA3 hashes (older fingerprint format) from captured pcaps. |
 | `evaluate_boringssl_ja4.py` | Sweep BoringSSL parameter variations and score the resulting JA4 fingerprint. |
