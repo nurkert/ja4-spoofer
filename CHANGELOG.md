@@ -4,6 +4,33 @@ All notable changes to JA4 Spoofer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] — 2026-05-13
+
+### Fixed
+
+- `scripts/run_curl_with_ja4.sh` and `scripts/build_curl_with_openssl.sh`
+  no longer hardcode `install/lib/`. OpenSSL's Configure installs to
+  `lib64/` on Debian/Ubuntu x86_64, which made the installed `.deb`
+  report a misleading "OpenSSL build not found" error even when the
+  build had succeeded. A new `resolve_install_libdir` helper in
+  `scripts/lib/util.sh` resolves whichever layout is present, and
+  `compat_prober.dart` does the same lookup. `scripts/build_openssl.sh`
+  additionally pins `--libdir=lib` so future builds are deterministic.
+- Linux window/taskbar icon now matches `assets/icon.png`. The
+  `flutter_launcher_icons` package is a no-op for Linux, so
+  `linux/runner/resources/app_icon.png` previously drifted from the
+  canonical source. A new `tools/ja4-spoofer/scripts/sync_app_icon.py`
+  regenerates the runner icon, and `package_linux_deb.sh` runs it
+  before each build.
+
+### Documentation
+
+- `docs/add-new-tool.md` documents the lib/lib64 pitfall and shows
+  contributors how to link new OpenSSL-backed CLI clients via
+  `resolve_install_libdir`. Clarifies that Chromium and Firefox link
+  their patched TLS stacks (BoringSSL / NSS) statically and are not
+  affected.
+
 ## [1.3.0] — 2026-05-12
 
 ### Added

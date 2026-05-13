@@ -104,6 +104,25 @@ cleanup_git_locks() {
   done
 }
 
+# Resolve the actual library directory of an `install/` prefix.
+#
+# OpenSSL Configure picks `lib/` or `lib64/` depending on the host (Debian on
+# x86_64 defaults to lib64, macOS/Arch use lib). Callers should not hardcode
+# either — pass them through this helper so run/build scripts work regardless
+# of how Configure landed.
+#
+# Echoes the resolved absolute path on stdout, or returns 1 if neither exists.
+resolve_install_libdir() {
+  local install_dir="$1"
+  for candidate in lib lib64; do
+    if [[ -d "$install_dir/$candidate" ]]; then
+      printf '%s\n' "$install_dir/$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Retry a command up to N times with a delay between attempts.
 # Usage: retry <max-attempts> <delay-secs> <command...>
 retry() {

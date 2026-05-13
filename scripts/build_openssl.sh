@@ -81,7 +81,13 @@ mkdir -p "$BUILD_DIR"
 echo "[info] Configuring OpenSSL..."
 cd "$OPENSSL_SRC"
 
-./Configure --prefix="$BUILD_DIR/install" --openssldir="$BUILD_DIR/install/ssl"
+# --libdir=lib pins the output layout so dependents do not need to guess
+# between lib/ and lib64/. On Debian-derivates with x86_64, OpenSSL otherwise
+# installs to lib64/ which breaks the LD_LIBRARY_PATH / PKG_CONFIG wiring in
+# the run_curl/build_curl helpers.
+./Configure --prefix="$BUILD_DIR/install" \
+            --openssldir="$BUILD_DIR/install/ssl" \
+            --libdir=lib
 
 echo "[info] Building OpenSSL..."
 make -j"$JOBS"

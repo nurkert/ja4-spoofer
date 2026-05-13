@@ -226,11 +226,16 @@ class CompatProber {
 
   String? _resolveLibDir(String curlBin) {
     // Heuristik: install-Layout `~/build/curl-openssl-ja4/install/bin/curl`
-    // → `~/build/openssl-ja4-standalone/install/lib`. Fallback: same dir.
+    // → `~/build/openssl-ja4-standalone/install/{lib,lib64}`. Probe beides,
+    // weil OpenSSL Configure auf Debian/x86_64 nach lib64/ installiert und
+    // auf macOS/Arch nach lib/. Fallback: same dir.
     if (curlBin.contains('curl-openssl-ja4')) {
       final home = Platform.environment['HOME'] ?? '';
-      final candidate = '$home/build/openssl-ja4-standalone/install/lib';
-      if (Directory(candidate).existsSync()) return candidate;
+      const opensslInstall = 'build/openssl-ja4-standalone/install';
+      for (final dirName in const ['lib', 'lib64']) {
+        final candidate = '$home/$opensslInstall/$dirName';
+        if (Directory(candidate).existsSync()) return candidate;
+      }
     }
     return null;
   }
