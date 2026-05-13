@@ -69,12 +69,12 @@ jobs:
         run: |
           set -euo pipefail
           # Lint the shell scripts that ship in the bundled runtime.
+          #   -x  follow `source` directives so cross-file lookups work
+          #       (e.g. `submodules` defined in lib.sh, consumed elsewhere).
           # Excluded codes:
-          #   SC1090/SC1091 — sourced from variable path (intentional in lib.sh chain)
-          #   SC2034        — sourced declarations (BROWSER_NAME etc are consumed
-          #                   by run_browser.sh after `source`); per-file
-          #                   `# shellcheck disable=SC2034` directives cover the
-          #                   intentional cases, but globally excluding keeps
-          #                   noise out without losing the rest of the checks.
+          #   SC1090/SC1091 — sourced from variable path (intentional)
+          #   SC2034        — declared-but-unused (browser declarations are
+          #                   consumed after `source`; covered case-by-case
+          #                   by inline disables where applicable).
           find scripts tools/ja4-spoofer/scripts -name '*.sh' -print0 \
-            | xargs -0 shellcheck -e SC1090,SC1091,SC2034
+            | xargs -0 shellcheck -x -e SC1090,SC1091,SC2034

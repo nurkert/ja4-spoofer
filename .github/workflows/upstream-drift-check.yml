@@ -1,0 +1,72 @@
+name: Upstream drift check
+
+# Manually triggered (`gh workflow run upstream-drift-check.yml`). Verifies
+# that the patch stack for each managed library still applies cleanly
+# against the pinned BASE_REF in a fresh upstream clone. Catches upstream
+# rebases, force-pushes, or stale BASE_REF pins before they reach users.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Drift check — ${{ matrix.lib }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lib: [boringssl, nss, openssl]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream URL and pinned ref
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source configs/managed-libs.env
+          case "${{ matrix.lib }}" in
+            boringssl) url="$BORINGSSL_URL" ;;
+            nss)       url="$NSS_URL" ;;
+            openssl)   url="$OPENSSL_URL" ;;
+            *) echo "::error::unknown library: ${{ matrix.lib }}"; exit 1 ;;
+          esac
+          ref_file="patches/${{ matrix.lib }}/BASE_REF"
+          if [[ ! -f "$ref_file" ]]; then
+            echo "::error::no BASE_REF file at $ref_file"
+            exit 1
+          fi
+          ref="$(tr -d '[:space:]' < "$ref_file")"
+          echo "url=$url"   >> "$GITHUB_OUTPUT"
+          echo "ref=$ref"   >> "$GITHUB_OUTPUT"
+          echo "[info] ${{ matrix.lib }}: pinned to $ref @ $url"
+
+      - name: Clone upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Shallow clone keeps the job fast even for large repos like
+          # boringssl/nss/openssl (~hundreds of MB at full depth).
+          git clone --depth 50 "${{ steps.resolve.outputs.url }}" \
+            "libs/${{ matrix.lib }}"
+          # If the pinned ref isn't in the shallow window, deepen.
+          if ! git -C "libs/${{ matrix.lib }}" rev-parse \
+               --verify --quiet "${{ steps.resolve.outputs.ref }}^{commit}"; then
+            echo "[info] ref not in shallow window — deepening"
+            git -C "libs/${{ matrix.lib }}" fetch --unshallow || \
+              git -C "libs/${{ matrix.lib }}" fetch --deepen 5000
+          fi
+
+      - name: Run apply_patches.sh --check
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/apply_patches.sh \
+            --only "${{ matrix.lib }}" \
+            --check
