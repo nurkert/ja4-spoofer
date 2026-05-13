@@ -4,6 +4,24 @@ All notable changes to JA4 Spoofer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] — 2026-05-13
+
+### Fixed
+
+- Linux launcher icon now renders crisply across the desktop. The previous
+  `.deb` shipped a single 2048×2048 PNG inside `hicolor/256x256/apps/`,
+  which most desktops (GNOME, Cinnamon, KDE) treat as broken and either
+  scale poorly or fall back to the generic application icon. The packager
+  now generates one matching PNG per hicolor size (16/32/48/64/128/256/512)
+  from `assets/icon.png`.
+- The `.desktop` entry sets `StartupWMClass=com.example.ja4_spoofer`
+  matching the GApplication application‑id, so the running window in the
+  dock / Alt‑Tab finally picks up the JA4 launcher icon instead of the
+  default placeholder.
+- New `DEBIAN/postinst` + `postrm` hooks refresh `gtk-update-icon-cache`
+  and `update-desktop-database` on install/upgrade/remove — without them
+  the new icons would only appear after a manual cache rebuild or relogin.
+
 ## [1.3.1] — 2026-05-13
 
 ### Fixed

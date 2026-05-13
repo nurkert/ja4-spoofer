@@ -182,7 +182,7 @@ mkdir -p "${PKG_ROOT}/DEBIAN"
 mkdir -p "${PKG_ROOT}/opt/${APP_NAME}"
 mkdir -p "${PKG_ROOT}/usr/bin"
 mkdir -p "${PKG_ROOT}/usr/share/applications"
-mkdir -p "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps"
+mkdir -p "${PKG_ROOT}/usr/share/icons/hicolor"
 
 # --- Copy the built app ---
 echo "[info] staging app payload"
@@ -196,6 +196,12 @@ EOF
 chmod 755 "${PKG_ROOT}/usr/bin/${APP_NAME}"
 
 # --- Desktop entry ---
+#
+# StartupWMClass tells GNOME/Wayland which running window belongs to this
+# launcher so the dock and Alt-Tab pick up the .desktop's Icon=. The value
+# must match the GApplication application-id set in linux/CMakeLists.txt
+# (currently the default `com.example.ja4_spoofer`); otherwise the dock
+# falls back to a generic placeholder for the running window.
 cat > "${PKG_ROOT}/usr/share/applications/${APP_NAME}.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -205,20 +211,73 @@ Exec=/usr/bin/${APP_NAME}
 Icon=${APP_NAME}
 Terminal=false
 Categories=Network;Security;Development;
+StartupNotify=true
+StartupWMClass=com.example.ja4_spoofer
 EOF
 
-# --- Optional icon (256x256 png) ---
-if [[ -f "${PROJECT_ROOT}/assets/icon-256.png" ]]; then
-  cp "${PROJECT_ROOT}/assets/icon-256.png" \
-     "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.png"
-elif [[ -f "${PROJECT_ROOT}/assets/icon.png" ]]; then
+# --- Hicolor launcher icons ---
+#
+# Populate every common size bucket from assets/icon.png. Hicolor consumers
+# (GNOME, Cinnamon, KDE) expect the actual PNG dimensions to match the
+# enclosing <size>x<size>/ directory — shipping one oversized PNG inside
+# `256x256/` makes most desktops fall back to the generic application icon.
+if command -v python3 >/dev/null 2>&1; then
+  if ! python3 "$(dirname "${SCRIPT_PATH}")/sync_app_icon.py" \
+        --hicolor-out "${PKG_ROOT}/usr/share/icons/hicolor" \
+        --icon-name "${APP_NAME}"; then
+    echo "[warn] hicolor icon generation failed — installing single PNG fallback" >&2
+    mkdir -p "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps"
+    cp "${PROJECT_ROOT}/assets/icon.png" \
+       "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.png"
+  fi
+else
+  echo "[warn] python3 not found — installing single PNG fallback (may render poorly)" >&2
+  mkdir -p "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps"
   cp "${PROJECT_ROOT}/assets/icon.png" \
      "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.png"
-elif [[ -f "${PROJECT_ROOT}/macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_512.png" ]]; then
-  # Fall back to scaled-down macOS icon if a dedicated linux icon doesn't exist
-  cp "${PROJECT_ROOT}/macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_512.png" \
-     "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.png"
 fi
+
+# --- postinst / postrm: refresh icon + desktop caches ---
+#
+# Without these hooks installed icons stay invisible until the user manually
+# runs `gtk-update-icon-cache`, and the launcher does not show up in the
+# Activities/menu search index. Both helpers gracefully no-op if the
+# corresponding binary is missing on the target system.
+cat > "${PKG_ROOT}/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true
+  fi
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+  fi
+fi
+
+exit 0
+EOF
+chmod 0755 "${PKG_ROOT}/DEBIAN/postinst"
+
+cat > "${PKG_ROOT}/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+
+case "$1" in
+  remove|purge|upgrade)
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications || true
+    fi
+    ;;
+esac
+
+exit 0
+EOF
+chmod 0755 "${PKG_ROOT}/DEBIAN/postrm"
 
 # --- DEBIAN control file ---
 INSTALLED_SIZE=$(du -sk "${PKG_ROOT}" | awk '{print $1}')
