@@ -49,6 +49,31 @@ Shell scripts under `scripts/` should pass `shellcheck` when reasonable.
 - No body unless it documents a non-obvious *why*
 - No co-author or generated-by trailers
 
+## Releases & CHANGELOG
+
+`CHANGELOG.md` is the source of truth for release notes — the release
+workflow extracts the section for the current version and uses it as the
+GitHub Release body. Before opening a release PR or pushing a `v*.*.*`
+tag, add a new section in [Keep a Changelog][keepachangelog] format:
+
+```markdown
+## [X.Y.Z] — YYYY-MM-DD
+
+### Added / Changed / Fixed / Documentation
+
+- …
+```
+
+Also append the matching reference link at the bottom of the file:
+
+```markdown
+[X.Y.Z]: https://github.com/nurkert/ja4-spoofer/releases/tag/vX.Y.Z
+```
+
+If the section is missing the release workflow aborts with a clear error.
+
+[keepachangelog]: https://keepachangelog.com/en/1.1.0/
+
 ## Adding a new client target
 
 1. Drop a new YAML in `tools/ja4-spoofer/assets/descriptors/`

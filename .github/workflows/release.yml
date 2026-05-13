@@ -260,6 +260,55 @@ jobs:
           # creates the tag at the right commit (not at github.sha).
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Extract CHANGELOG section
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pull the `## [VERSION]` block out of CHANGELOG.md and combine it
+          # with the static install instructions. CHANGELOG.md is the source
+          # of truth for release notes — generateReleaseNotes is disabled.
+          if ! grep -qE "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing an entry for [${VERSION}]"
+            echo "::error::Add a section like '## [${VERSION}] — YYYY-MM-DD' before releasing."
+            exit 1
+          fi
+          awk -v ver="${VERSION}" '
+            $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
+            capture && /^## \[/      { exit }
+            capture                  { print }
+          ' CHANGELOG.md > release-body.md
+          {
+            echo
+            echo "---"
+            echo
+            echo "## Install"
+            echo
+            echo "APT (recommended):"
+            echo
+            echo '```bash'
+            echo 'sudo apt update && sudo apt install ja4-spoofer'
+            echo '```'
+            echo
+            echo "Direct download:"
+            echo
+            echo '```bash'
+            echo 'sudo dpkg -i ja4-spoofer_*.deb'
+            echo 'sudo apt-get install -f   # resolves any missing deps'
+            echo '```'
+            echo
+            echo "Verify the artifact:"
+            echo
+            echo '```bash'
+            echo 'sha256sum -c SHA256SUMS'
+            echo 'gpg --verify ja4-spoofer_*.deb.asc ja4-spoofer_*.deb   # if signed'
+            echo '```'
+            echo
+            echo "On first launch the app extracts its scripts, configs and patches to"
+            echo '`~/.ja4-spoofer/runtime/<version>/`. No repository checkout needed.'
+          } >> release-body.md
+          echo "---- release-body.md ----"
+          cat release-body.md
+
       - name: Create GitHub release
         uses: ncipollo/release-action@v1
         with:
@@ -270,29 +319,5 @@ jobs:
           artifactErrorsFailBuild: true
           allowUpdates: true
           makeLatest: true
-          generateReleaseNotes: true
-          body: |
-            ## Install
-
-            APT (recommended):
-
-            ```bash
-            sudo apt update && sudo apt install ja4-spoofer
-            ```
-
-            Direct download:
-
-            ```bash
-            sudo dpkg -i ja4-spoofer_*.deb
-            sudo apt-get install -f   # resolves any missing deps
-            ```
-
-            Verify the artifact:
-
-            ```bash
-            sha256sum -c SHA256SUMS
-            gpg --verify ja4-spoofer_*.deb.asc ja4-spoofer_*.deb   # if signed
-            ```
-
-            On first launch the app extracts its scripts, configs and patches to
-            `~/.ja4-spoofer/runtime/<version>/`. No repository checkout needed.
+          generateReleaseNotes: false
+          bodyFile: release-body.md
