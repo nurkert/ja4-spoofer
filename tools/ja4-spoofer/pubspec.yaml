@@ -12,7 +12,7 @@ dependencies:
     sdk: flutter
 
   cupertino_icons: ^1.0.8
-  shadcn_ui: ^0.46.1
+  shadcn_ui: ^0.54.0
   csv: ^7.1.0
   yaml: ^3.1.2
   file_picker: ^8.1.7
