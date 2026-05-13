@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """Regenerate platform launcher/window icons from assets/icon.png.
 
-The Flutter `flutter_launcher_icons` package does not actually generate Linux
-icons, so without this helper `linux/runner/resources/app_icon.png` (used by
-the GTK runner for the window/taskbar icon) silently drifts away from
-`assets/icon.png`. The packaging step calls this script so the bundled icon
-always matches the canonical source.
+The Flutter `flutter_launcher_icons` package does not generate Linux icons,
+so without this helper:
 
-Usage:
-  scripts/sync_app_icon.py [--source <path>] [--check]
+  * `linux/runner/resources/app_icon.png` (used by the GTK runner for the
+    in-window/titlebar icon) silently drifts from `assets/icon.png`.
+  * The `.deb` ships a single oversized PNG under `hicolor/256x256/apps/`,
+    which most desktops (GNOME, Cinnamon, KDE) treat as broken: directories
+    in the hicolor theme are *expected* to contain icons matching their
+    declared size, otherwise the lookup either falls back to the generic
+    placeholder or scales poorly.
 
-The script targets the Linux runner resource by default; macOS and Windows
-already have working flutter_launcher_icons pipelines and are left alone.
+This script handles both cases:
+
+  scripts/sync_app_icon.py                # regenerate the runner icon
+  scripts/sync_app_icon.py \
+      --hicolor-out <stage>/usr/share/icons/hicolor
+                                          # populate every hicolor size
+                                          # bucket used by the .deb
+
+`--check` exits non-zero if any target would change (useful as a CI guard).
 """
 from __future__ import annotations
 
@@ -35,13 +44,18 @@ def _resolve_project_root() -> Path:
 
 
 # (relative path inside tools/ja4-spoofer, target square size in px)
-_LINUX_TARGETS: tuple[tuple[str, int], ...] = (
+_LINUX_RUNNER_TARGETS: tuple[tuple[str, int], ...] = (
     ("linux/runner/resources/app_icon.png", 256),
 )
 
+# Hicolor sizes shipped in the .deb. 16/32 cover small widget chrome,
+# 48/64 cover panel/taskbar slots, 128/256 cover Activities/Alt-Tab,
+# 512 is what GNOME uses for the Software/Files preview.
+_HICOLOR_SIZES: tuple[int, ...] = (16, 32, 48, 64, 128, 256, 512)
+
 
 def _resize(src: Path, dst: Path, size: int) -> bool:
-    """Return True if dst was written (i.e. content changed)."""
+    """Resize src to a square `size`px image. Returns True if dst changed."""
     with Image.open(src) as img:
         img = img.convert("RGBA")
         resized = img.resize((size, size), Image.LANCZOS)
@@ -58,6 +72,31 @@ def _resize(src: Path, dst: Path, size: int) -> bool:
         return True
 
 
+def _sync_runner_icons(project_root: Path, src: Path) -> bool:
+    drift = False
+    for rel, size in _LINUX_RUNNER_TARGETS:
+        dst = project_root / rel
+        if _resize(src, dst, size):
+            print(f"[info] regenerated {rel} ({size}x{size})")
+            drift = True
+        else:
+            print(f"[ok]   {rel} already in sync")
+    return drift
+
+
+def _sync_hicolor(src: Path, hicolor_root: Path, icon_name: str) -> bool:
+    """Populate hicolor/<size>x<size>/apps/<icon_name>.png for every size."""
+    drift = False
+    for size in _HICOLOR_SIZES:
+        dst = hicolor_root / f"{size}x{size}" / "apps" / f"{icon_name}.png"
+        if _resize(src, dst, size):
+            print(f"[info] regenerated hicolor/{size}x{size}/apps/{icon_name}.png")
+            drift = True
+        else:
+            print(f"[ok]   hicolor/{size}x{size}/apps/{icon_name}.png in sync")
+    return drift
+
+
 def main() -> int:
     project_root = _resolve_project_root()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -65,6 +104,20 @@ def main() -> int:
         "--source",
         default=str(project_root / "assets" / "icon.png"),
         help="canonical source PNG (default: assets/icon.png)",
+    )
+    parser.add_argument(
+        "--hicolor-out",
+        default=None,
+        help=(
+            "If set, also write hicolor/<size>x<size>/apps/<icon-name>.png "
+            "under this directory (typically the .deb staging "
+            "<root>/usr/share/icons/hicolor)."
+        ),
+    )
+    parser.add_argument(
+        "--icon-name",
+        default="ja4-spoofer",
+        help="basename used for hicolor entries (default: ja4-spoofer)",
     )
     parser.add_argument(
         "--check",
@@ -78,15 +131,11 @@ def main() -> int:
         sys.stderr.write(f"[error] source icon not found: {src}\n")
         return 1
 
-    drift = False
-    for rel, size in _LINUX_TARGETS:
-        dst = project_root / rel
-        changed = _resize(src, dst, size)
-        if changed:
-            print(f"[info] regenerated {rel} ({size}x{size})")
-            drift = True
-        else:
-            print(f"[ok]   {rel} already in sync")
+    drift = _sync_runner_icons(project_root, src)
+
+    if args.hicolor_out is not None:
+        hicolor_root = Path(args.hicolor_out).resolve()
+        drift = _sync_hicolor(src, hicolor_root, args.icon_name) or drift
 
     if args.check and drift:
         sys.stderr.write(
