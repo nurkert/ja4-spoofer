@@ -74,6 +74,9 @@ USAGE
 }
 
 parse_ja4_args() {
+  # BROWSER_BIN_OPTION expands to e.g. --chromium-bin from the sourced
+  # browser declaration; it is a literal flag string, not a glob.
+  # shellcheck disable=SC2254
   while [[ $# -gt 0 ]]; do
     case "$1" in
       $BROWSER_BIN_OPTION|--browser-bin)

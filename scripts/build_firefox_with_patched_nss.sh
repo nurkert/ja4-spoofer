@@ -458,7 +458,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     # back to xcrun (works for any user with CommandLineTools) so the
     # script is portable across machines without hardcoded user paths.
     macos_sdk=""
-    bundled_sdk="$(ls -d "$HOME/.mozbuild/MacOSX"*.sdk 2>/dev/null | sort -V | tail -1)"
+    bundled_sdk="$(find "$HOME/.mozbuild" -maxdepth 1 -type d -name 'MacOSX*.sdk' 2>/dev/null | sort -V | tail -1)"
     if [[ -n "$bundled_sdk" && -d "$bundled_sdk" ]]; then
       macos_sdk="$bundled_sdk"
     elif command -v xcrun >/dev/null 2>&1; then

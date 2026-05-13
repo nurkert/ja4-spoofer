@@ -74,9 +74,7 @@ class _AppShellState extends State<AppShell> {
     if (stack != null) debugPrintStack(stackTrace: stack);
     if (!mounted) return;
     ShadSonner.of(context).show(
-      ShadToast.destructive(
-        description: Text('Initialisation failed: $error'),
-      ),
+      ShadToast.destructive(description: Text('Initialisation failed: $error')),
     );
   }
 
@@ -175,26 +173,33 @@ class _AppShellState extends State<AppShell> {
     });
 
     unawaited(
-      launcherController.loadApps().then((_) {
-        if (!mounted) return;
-        // 5. QuickLaunchController — after apps are loaded
-        final quickLaunchController = QuickLaunchController(
-          apps: launcherController.apps,
-          configuratorController: configuratorController,
-          profileCatalogController: profileCatalogController,
-        );
-        setState(() => _quickLaunchController = quickLaunchController);
-        unawaited(
-          profileCatalogController.load().then((_) {
-            if (!mounted) return Future<void>.value();
-            return quickLaunchController.restoreSelectionIntoConfigurator();
-          }).catchError((Object e, StackTrace st) {
+      launcherController
+          .loadApps()
+          .then((_) {
+            if (!mounted) return;
+            // 5. QuickLaunchController — after apps are loaded
+            final quickLaunchController = QuickLaunchController(
+              apps: launcherController.apps,
+              configuratorController: configuratorController,
+              profileCatalogController: profileCatalogController,
+            );
+            setState(() => _quickLaunchController = quickLaunchController);
+            unawaited(
+              profileCatalogController
+                  .load()
+                  .then((_) {
+                    if (!mounted) return Future<void>.value();
+                    return quickLaunchController
+                        .restoreSelectionIntoConfigurator();
+                  })
+                  .catchError((Object e, StackTrace st) {
+                    _reportInitError(e, st);
+                  }),
+            );
+          })
+          .catchError((Object e, StackTrace st) {
             _reportInitError(e, st);
           }),
-        );
-      }).catchError((Object e, StackTrace st) {
-        _reportInitError(e, st);
-      }),
     );
 
     // Load registries once here, not on every tab visit. Honour the

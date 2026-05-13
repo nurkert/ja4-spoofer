@@ -38,7 +38,7 @@ Widget _wrap(QuickLaunchController controller) {
           padding: const EdgeInsets.all(20),
           child: AnimatedBuilder(
             animation: controller,
-            builder: (_, _x) => RandomizeOptionsCard(controller: controller),
+            builder: (_, _) => RandomizeOptionsCard(controller: controller),
           ),
         ),
       ),

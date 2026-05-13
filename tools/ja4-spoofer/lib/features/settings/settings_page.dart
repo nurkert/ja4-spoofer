@@ -42,9 +42,11 @@ class _SettingsPageState extends State<SettingsPage> {
     // a markNeedsBuild to SettingsScope ancestors mid-build.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      unawaited(_controller.load().then((_) {
-        if (mounted) _syncTextFields();
-      }));
+      unawaited(
+        _controller.load().then((_) {
+          if (mounted) _syncTextFields();
+        }),
+      );
     });
   }
 

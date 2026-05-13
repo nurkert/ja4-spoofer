@@ -8,9 +8,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/env.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/util.sh"
 
 # depot_tools must be in PATH (not covered by lib/env.sh)
-for _dir in "$HOME/depot_tools"; do
-  [[ -d "$_dir" && ":$PATH:" != *":$_dir:"* ]] && export PATH="$_dir:$PATH"
-done
+_depot_dir="$HOME/depot_tools"
+if [[ -d "$_depot_dir" && ":$PATH:" != *":$_depot_dir:"* ]]; then
+  export PATH="$_depot_dir:$PATH"
+fi
+unset _depot_dir
 
 config_file="$REPO_ROOT/configs/chromium-build-pin.env"
 

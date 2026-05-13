@@ -91,25 +91,27 @@ class ConfiguratorPage extends StatelessWidget {
       text: controller.editingMetadata.name,
     );
     String? selectedFormat = controller.editingMetadata.profileFormat;
-    unawaited(showShadDialog(
-      context: context,
-      builder: (dialogContext) => _SaveAsDialog(
-        nameCtrl: nameCtrl,
-        initialFormat: selectedFormat,
-        onSave: (name, format) async {
-          controller.setEditingProfileFormat(format);
-          final profile = await controller.duplicateAsNew(name);
-          await profileCatalogController.refresh();
-          await profileCatalogController.selectProfile(profile.profileId);
-          if (dialogContext.mounted) {
-            Navigator.of(dialogContext).pop();
-            ShadSonner.of(
-              context,
-            ).show(ShadToast(description: Text('Profile "$name" saved')));
-          }
-        },
+    unawaited(
+      showShadDialog(
+        context: context,
+        builder: (dialogContext) => _SaveAsDialog(
+          nameCtrl: nameCtrl,
+          initialFormat: selectedFormat,
+          onSave: (name, format) async {
+            controller.setEditingProfileFormat(format);
+            final profile = await controller.duplicateAsNew(name);
+            await profileCatalogController.refresh();
+            await profileCatalogController.selectProfile(profile.profileId);
+            if (dialogContext.mounted) {
+              Navigator.of(dialogContext).pop();
+              ShadSonner.of(
+                context,
+              ).show(ShadToast(description: Text('Profile "$name" saved')));
+            }
+          },
+        ),
       ),
-    ));
+    );
   }
 
   @override

@@ -1,4 +1,7 @@
 # Browser declaration: Chromium with patched BoringSSL
+# shellcheck shell=bash
+# shellcheck disable=SC2034
+# (sourced by scripts/run_browser.sh; variables below are consumed there)
 
 BROWSER_NAME="Chromium"
 BROWSER_BIN_ENV_VAR="CHROMIUM_BIN"
