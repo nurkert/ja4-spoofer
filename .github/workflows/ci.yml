@@ -44,7 +44,15 @@ jobs:
 
       - name: Flutter test
         working-directory: tools/ja4-spoofer
-        run: flutter test
+        run: flutter test --coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: tools/ja4-spoofer/coverage/lcov.info
+          flags: flutter
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   shell:
     name: ShellCheck
