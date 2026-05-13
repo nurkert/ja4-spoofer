@@ -6,18 +6,23 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 with_wip=0
 force=0
+check_only=0
 
 filter_sub=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/apply_patches.sh [--with-wip] [--only <submodule>] [--force]
+Usage: scripts/apply_patches.sh [--with-wip] [--only <submodule>] [--force] [--check]
 
   --with-wip          Also apply *.diff files from patches/<lib>/ after git-am patches.
   --only <submodule>  Only patch the given submodule (e.g. nss, openssl, boringssl).
   --force             Reset my-changes even when it carries WIP commits or a
                       dirty working tree. Default behaviour aborts to prevent
                       silent data loss.
+  --check             Dry-run: verify each patch applies cleanly against the
+                      BASE_REF in a throwaway git worktree, without touching
+                      libs/<sub> or the my-changes branch. Exit non-zero on
+                      first failure with the full git stderr.
 USAGE
 }
 
@@ -36,6 +41,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --force)
       force=1
+      ;;
+    --check)
+      check_only=1
       ;;
     -h|--help)
       usage
@@ -88,6 +96,35 @@ for name in "${submodules[@]}"; do
   echo "[info] $name: fetching upstream"
   git -C "$sub_path" fetch origin >/dev/null
 
+  if [[ "$check_only" -eq 1 ]]; then
+    if ! ls "$patch_dir"/*.patch >/dev/null 2>&1; then
+      echo "[ok]  $name: no patches to check"
+      continue
+    fi
+    # Verify each patch applies cleanly against the BASE_REF in a throwaway
+    # worktree. Leaves libs/$name and the my-changes branch untouched.
+    check_dir=$(mktemp -d -t "ja4-check-$name.XXXXXX")
+    trap 'git -C "$sub_path" worktree remove --force "$check_dir" >/dev/null 2>&1 || true; rm -rf "$check_dir"' EXIT
+    echo "[info] $name: spinning up check worktree at $upstream_ref"
+    git -C "$sub_path" worktree add --detach -f "$check_dir" "$upstream_ref" >/dev/null
+    rc=0
+    for patch_file in "$patch_dir"/*.patch; do
+      if ! git -C "$check_dir" apply --check "$patch_file"; then
+        echo "[error] $name: patch does not apply cleanly: $(basename "$patch_file")" >&2
+        rc=1
+        break
+      fi
+    done
+    git -C "$sub_path" worktree remove --force "$check_dir" >/dev/null 2>&1 || true
+    rm -rf "$check_dir"
+    trap - EXIT
+    if [[ "$rc" -ne 0 ]]; then
+      exit "$rc"
+    fi
+    echo "[ok]  $name: all patches apply cleanly against $upstream_ref"
+    continue
+  fi
+
   # Protect any work-in-progress on an existing `my-changes` branch before
   # we reset it. Two cases lose data silently otherwise:
   #   1. The user committed extra work on top of the applied patches.
@@ -125,7 +162,13 @@ for name in "${submodules[@]}"; do
 
   if ls "$patch_dir"/*.patch >/dev/null 2>&1; then
     echo "[info] $name: applying patches"
-    git -C "$sub_path" -c commit.gpgsign=false am "$patch_dir"/*.patch >/dev/null
+    # Send stderr through unchanged so a failing `git am` shows the
+    # actual conflict trace rather than vanishing silently.
+    if ! git -C "$sub_path" -c commit.gpgsign=false am "$patch_dir"/*.patch >/dev/null; then
+      echo "[error] $name: git am failed — leaving submodule in mid-am state for inspection" >&2
+      echo "[hint]  cd libs/$name && git status && git am --abort  # to recover" >&2
+      exit 1
+    fi
     echo "[ok]  $name: patches applied"
   else
     echo "[ok]  $name: no patches to apply"

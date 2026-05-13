@@ -100,6 +100,34 @@ git commit -m "Update OpenSSL JA4 patch stack"
 6. Run `scripts/refresh_patches.sh`.
 7. Commit the updated `BASE_REF`, patch files and submodule pointer.
 
+## Drift Check
+
+Upstream BoringSSL/NSS/OpenSSL occasionally rebase or rewrite history,
+which can silently invalidate the patch stack against the pinned
+`BASE_REF`. The dry-run mode catches this before users hit it at build
+time:
+
+```bash
+# Local: against the current libs/<name> checkout.
+scripts/apply_patches.sh --only openssl --check
+```
+
+A temporary git worktree is created at `BASE_REF`, every `*.patch` is
+fed through `git apply --check`, and the worktree is removed. Your
+`libs/<name>` checkout and the `my-changes` branch are not touched.
+
+For a fresh-clone validation that mirrors what an end user would
+experience, trigger the workflow:
+
+```bash
+gh workflow run upstream-drift-check.yml
+```
+
+It matrix-clones BoringSSL/NSS/OpenSSL upstream, checks out each
+`BASE_REF`, and runs `scripts/apply_patches.sh --only <lib> --check`
+against the fresh tree. The job goes red on the first failing patch,
+with the full conflict trace in the log.
+
 ## Patch Internals
 
 Implementation notes for reviewers live in:
