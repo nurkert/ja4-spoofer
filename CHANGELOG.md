@@ -123,6 +123,8 @@ Initial public release.
 - Seed profiles for Safari, Brave, Tor, Zen, Apple Mail, curl, Chromium,
   Firefox.
 
+[1.3.2]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.3.2
+[1.3.1]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.3.1
 [1.3.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.3.0
 [1.2.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.2.0
 [1.1.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.1.0
