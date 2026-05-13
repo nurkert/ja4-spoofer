@@ -47,7 +47,7 @@ repository checkout.
 ### Install from the APT repository (recommended)
 
 ```bash
-   curl -fsSL https://apt.nurkert.de/install/ja4-spoofer | sudo sh
+curl -fsSL https://apt.nurkert.de/install/ja4-spoofer | sudo sh
 ```
 
 Upgrades arrive via `sudo apt upgrade` like any other package. Uninstall with
