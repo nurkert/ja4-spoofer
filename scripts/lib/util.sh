@@ -69,6 +69,9 @@ load_env_config() {
     # Expand a leading `~/` to `$HOME/` (the only expansion we allow).
     # Use substring slicing rather than pattern stripping so bash's own
     # tilde expansion in `${var#~/}` patterns can't corrupt the result.
+    # Tilde is intentionally compared as a literal below — we are inspecting
+    # raw config text, not shell-expanding it.
+    # shellcheck disable=SC2088
     if [[ "$value" == "~" ]]; then
       value="$HOME"
     elif [[ "${value:0:2}" == "~/" ]]; then
@@ -84,6 +87,9 @@ load_env_config() {
     fi
 
     printf -v "$key" '%s' "$value"
+    # shellcheck disable=SC2163
+    # $key holds the variable name (e.g. FOO), so `export "$key"` exports
+    # the variable named FOO. That is the desired indirect export.
     export "$key"
   done < "$file"
 }

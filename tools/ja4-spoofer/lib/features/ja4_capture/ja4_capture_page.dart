@@ -162,67 +162,69 @@ class _CaptureRowState extends State<_CaptureRow> {
     final versionCtrl = TextEditingController();
     final iconUrlCtrl = TextEditingController();
 
-    unawaited(showShadDialog(
-      context: context,
-      builder: (dialogContext) => ShadDialog(
-        title: const Text('Save Capture as Profile'),
-        description: const Text(
-          'Give this fingerprint a name to identify it later.',
-        ),
-        actions: [
-          ShadButton.outline(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('Cancel'),
+    unawaited(
+      showShadDialog(
+        context: context,
+        builder: (dialogContext) => ShadDialog(
+          title: const Text('Save Capture as Profile'),
+          description: const Text(
+            'Give this fingerprint a name to identify it later.',
           ),
-          ShadButton(
-            onPressed: () {
-              final name = nameCtrl.text.trim();
-              if (name.isEmpty) return;
-              final version = versionCtrl.text.trim();
-              final iconUrl = iconUrlCtrl.text.trim();
-              unawaited(
-                widget.controller.saveCapture(
-                  record,
-                  name: name,
-                  version: version.isEmpty ? null : version,
-                  iconUrl: iconUrl.isEmpty ? null : iconUrl,
-                ),
-              );
-              Navigator.of(dialogContext).pop();
-              setState(() => _saved = true);
-            },
-            child: const Text('Save'),
-          ),
-        ],
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const SizedBox(height: 12),
-            const Text('Name', style: TextStyle(fontSize: 12)),
-            const SizedBox(height: 4),
-            ShadInput(
-              controller: nameCtrl,
-              placeholder: const Text('e.g. Safari macOS'),
+          actions: [
+            ShadButton.outline(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Cancel'),
             ),
-            const SizedBox(height: 12),
-            const Text('Version', style: TextStyle(fontSize: 12)),
-            const SizedBox(height: 4),
-            ShadInput(
-              controller: versionCtrl,
-              placeholder: const Text('e.g. 18.2'),
-            ),
-            const SizedBox(height: 12),
-            const Text('Icon URL', style: TextStyle(fontSize: 12)),
-            const SizedBox(height: 4),
-            ShadInput(
-              controller: iconUrlCtrl,
-              placeholder: const Text('https://example.com/logo.svg'),
+            ShadButton(
+              onPressed: () {
+                final name = nameCtrl.text.trim();
+                if (name.isEmpty) return;
+                final version = versionCtrl.text.trim();
+                final iconUrl = iconUrlCtrl.text.trim();
+                unawaited(
+                  widget.controller.saveCapture(
+                    record,
+                    name: name,
+                    version: version.isEmpty ? null : version,
+                    iconUrl: iconUrl.isEmpty ? null : iconUrl,
+                  ),
+                );
+                Navigator.of(dialogContext).pop();
+                setState(() => _saved = true);
+              },
+              child: const Text('Save'),
             ),
           ],
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SizedBox(height: 12),
+              const Text('Name', style: TextStyle(fontSize: 12)),
+              const SizedBox(height: 4),
+              ShadInput(
+                controller: nameCtrl,
+                placeholder: const Text('e.g. Safari macOS'),
+              ),
+              const SizedBox(height: 12),
+              const Text('Version', style: TextStyle(fontSize: 12)),
+              const SizedBox(height: 4),
+              ShadInput(
+                controller: versionCtrl,
+                placeholder: const Text('e.g. 18.2'),
+              ),
+              const SizedBox(height: 12),
+              const Text('Icon URL', style: TextStyle(fontSize: 12)),
+              const SizedBox(height: 4),
+              ShadInput(
+                controller: iconUrlCtrl,
+                placeholder: const Text('https://example.com/logo.svg'),
+              ),
+            ],
+          ),
         ),
       ),
-    ));
+    );
   }
 
   @override

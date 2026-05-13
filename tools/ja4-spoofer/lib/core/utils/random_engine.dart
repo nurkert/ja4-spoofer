@@ -234,16 +234,16 @@ class RandomEngine {
 
     // TLS versions: determine which to offer based on tlsVersionMode.
     // Uses subSeedBytes[9] so the result is stable across mutation-config changes.
-    const _versionSets = [
+    const versionSets = [
       ['1.2', '1.3'], // v12and13 (index 0)
       ['1.3'], // v13only  (index 1)
       ['1.2'], // v12only  (index 2)
     ];
     final versionSet = switch (config.tlsVersionMode) {
-      TlsVersionMode.v12and13 => _versionSets[0],
-      TlsVersionMode.v13only => _versionSets[1],
-      TlsVersionMode.v12only => _versionSets[2],
-      TlsVersionMode.random => _versionSets[subSeedBytes[9] % 3],
+      TlsVersionMode.v12and13 => versionSets[0],
+      TlsVersionMode.v13only => versionSets[1],
+      TlsVersionMode.v12only => versionSets[2],
+      TlsVersionMode.random => versionSets[subSeedBytes[9] % 3],
     };
     final (minVer, maxVer) = _tlsVersionRange(versionSet);
 
@@ -271,14 +271,14 @@ class RandomEngine {
     };
 
     // ALPN: subSeedBytes[10] for stable picks across mutation-config changes.
-    const _alpnOptions = [
+    const alpnOptions = [
       ['h2', 'http/1.1'],
       ['h2'],
       ['http/1.1'],
       ['h2', 'http/1.1', 'h3-29'],
     ];
     final alpnProtocols = config.alpnMode == AlpnMode.random
-        ? _alpnOptions[subSeedBytes[10] % _alpnOptions.length]
+        ? alpnOptions[subSeedBytes[10] % alpnOptions.length]
         : defaults.alpnProtocols.isEmpty
         ? const ['h2', 'http/1.1']
         : List<String>.from(defaults.alpnProtocols);

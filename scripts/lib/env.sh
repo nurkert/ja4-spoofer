@@ -17,6 +17,9 @@ IS_MACOS=0; [[ "$(uname -s)" == "Darwin" ]] && IS_MACOS=1
 # Homebrew bash. $0 is the top-level script (e.g. run_browser.sh).
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
   for _candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    # shellcheck disable=SC2016
+    # Single quotes are intentional: BASH_VERSINFO must expand in the
+    # candidate bash, not in this (possibly outdated) shell.
     if [[ -x "$_candidate" ]] && "$_candidate" -c '[[ ${BASH_VERSINFO[0]} -ge 4 ]]' 2>/dev/null; then
       exec "$_candidate" "$0" "$@"
     fi

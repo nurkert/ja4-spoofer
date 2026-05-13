@@ -1,4 +1,7 @@
 # Browser declaration: Firefox with patched NSS
+# shellcheck shell=bash
+# shellcheck disable=SC2034
+# (sourced by scripts/run_browser.sh; variables below are consumed there)
 
 BROWSER_NAME="Firefox"
 BROWSER_BIN_ENV_VAR="FIREFOX_BIN"

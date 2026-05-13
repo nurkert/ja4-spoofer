@@ -325,72 +325,77 @@ class _RequirementsInfoButton extends StatelessWidget {
         .where((r) => r.name.trim().isNotEmpty)
         .toList(growable: false);
 
-    unawaited(showDialog<void>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Build Requirements', style: TextStyle(fontSize: 15)),
-        content: SizedBox(
-          width: 380,
-          child: visibleRequirements.isEmpty
-              ? const Text(
-                  'No build requirements declared for this app.',
-                  style: TextStyle(fontSize: 12),
-                )
-              : SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: visibleRequirements
-                        .map(
-                          (r) => Padding(
-                            padding: const EdgeInsets.only(bottom: 8),
-                            child: Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '\u2022  ',
-                                  style: TextStyle(fontSize: 12),
-                                ),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        '${r.name}${r.version != null ? ' ${r.version}' : ''}',
-                                        style: const TextStyle(
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w500,
-                                        ),
-                                      ),
-                                      if (r.hint != null)
-                                        SelectableText(
-                                          r.hint!,
+    unawaited(
+      showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text(
+            'Build Requirements',
+            style: TextStyle(fontSize: 15),
+          ),
+          content: SizedBox(
+            width: 380,
+            child: visibleRequirements.isEmpty
+                ? const Text(
+                    'No build requirements declared for this app.',
+                    style: TextStyle(fontSize: 12),
+                  )
+                : SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: visibleRequirements
+                          .map(
+                            (r) => Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    '\u2022  ',
+                                    style: TextStyle(fontSize: 12),
+                                  ),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          '${r.name}${r.version != null ? ' ${r.version}' : ''}',
                                           style: const TextStyle(
-                                            fontSize: 11,
-                                            fontFamily: 'Geist Mono',
-                                            color: Colors.grey,
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w500,
                                           ),
                                         ),
-                                    ],
+                                        if (r.hint != null)
+                                          SelectableText(
+                                            r.hint!,
+                                            style: const TextStyle(
+                                              fontSize: 11,
+                                              fontFamily: 'Geist Mono',
+                                              color: Colors.grey,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
                                   ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
-                          ),
-                        )
-                        .toList(),
+                          )
+                          .toList(),
+                    ),
                   ),
-                ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Close'),
           ),
-        ],
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
       ),
-    ));
+    );
   }
 
   @override

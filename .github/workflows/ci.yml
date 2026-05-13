@@ -34,9 +34,13 @@ jobs:
         working-directory: tools/ja4-spoofer
         run: flutter pub get
 
+      - name: Dart format check
+        working-directory: tools/ja4-spoofer
+        run: dart format --output=none --set-exit-if-changed .
+
       - name: Flutter analyze
         working-directory: tools/ja4-spoofer
-        run: flutter analyze
+        run: flutter analyze --fatal-infos --fatal-warnings
 
       - name: Flutter test
         working-directory: tools/ja4-spoofer
@@ -55,9 +59,14 @@ jobs:
 
       - name: Run shellcheck
         run: |
-          set -e
-          # Lint the shell scripts that ship in the bundled runtime. We
-          # exclude SC1090/SC1091 (sourced from variable path) — those are
-          # intentional in our lib.sh / env.sh chain.
+          set -euo pipefail
+          # Lint the shell scripts that ship in the bundled runtime.
+          # Excluded codes:
+          #   SC1090/SC1091 — sourced from variable path (intentional in lib.sh chain)
+          #   SC2034        — sourced declarations (BROWSER_NAME etc are consumed
+          #                   by run_browser.sh after `source`); per-file
+          #                   `# shellcheck disable=SC2034` directives cover the
+          #                   intentional cases, but globally excluding keeps
+          #                   noise out without losing the rest of the checks.
           find scripts tools/ja4-spoofer/scripts -name '*.sh' -print0 \
-            | xargs -0 shellcheck -e SC1090,SC1091 || true
+            | xargs -0 shellcheck -e SC1090,SC1091,SC2034
