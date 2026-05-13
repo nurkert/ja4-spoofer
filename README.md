@@ -47,18 +47,7 @@ repository checkout.
 ### Install from the APT repository (recommended)
 
 ```bash
-# Add Nurkert APT key
-sudo mkdir -p /usr/share/keyrings
-curl -fsSL https://apt.nurkert.de/KEY.gpg \
-  | sudo gpg --dearmor -o /usr/share/keyrings/nurkert-archive-keyring.gpg
-
-# Add repository
-echo "deb [signed-by=/usr/share/keyrings/nurkert-archive-keyring.gpg] https://apt.nurkert.de stable main" \
-  | sudo tee /etc/apt/sources.list.d/nurkert.list
-
-# Install ja4-spoofer
-sudo apt update
-sudo apt install ja4-spoofer
+   curl -fsSL https://apt.nurkert.de/install/ja4-spoofer | sudo sh
 ```
 
 Upgrades arrive via `sudo apt upgrade` like any other package. Uninstall with
