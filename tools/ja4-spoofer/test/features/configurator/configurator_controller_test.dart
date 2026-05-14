@@ -177,4 +177,30 @@ void main() {
       );
     },
   );
+
+  test('setTlsMin above current tlsMax clamps tlsMax up', () {
+    final controller = ConfiguratorController()
+      ..setTlsMin('1.2')
+      ..setTlsMax('1.2');
+    controller.setTlsMin('1.3');
+    expect(controller.tlsMin, '1.3');
+    expect(
+      controller.tlsMax,
+      '1.3',
+      reason: 'tlsMax should clamp up when min rises above it',
+    );
+  });
+
+  test('setTlsMax below current tlsMin clamps tlsMin down', () {
+    final controller = ConfiguratorController()
+      ..setTlsMin('1.3')
+      ..setTlsMax('1.3');
+    controller.setTlsMax('1.0');
+    expect(controller.tlsMax, '1.0');
+    expect(
+      controller.tlsMin,
+      '1.0',
+      reason: 'tlsMin should clamp down when max drops below it',
+    );
+  });
 }

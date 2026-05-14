@@ -357,4 +357,93 @@ void main() {
       expect(result.sniMode, 'present');
     });
   });
+
+  group('Malformed input bounds', () {
+    test(
+      'supportedVersions returns empty list when declared length exceeds buffer',
+      () {
+        // 1-byte length prefix says "10 bytes follow" but only 4 are
+        // actually present. The old parser returned a partial list of
+        // garbage IDs; the hardened parser fails closed.
+        final hello = _buildClientHello(
+          extensions: [
+            _Ext(0x002b, [0x0a, 0x03, 0x04, 0x03, 0x03]),
+          ],
+        );
+        final parsed = const TlsClientHelloParser().parse(hello);
+        expect(parsed, isNotNull);
+        expect(
+          parsed!.supportedVersions,
+          isEmpty,
+          reason: 'truncated length must produce empty list, not partial',
+        );
+      },
+    );
+
+    test(
+      'extension loop aborts when an extension claims length past buffer',
+      () {
+        // Build a hand-crafted extensions block: one well-formed ALPN
+        // extension followed by a bogus extension whose length field
+        // overshoots. The well-formed one should still register; the
+        // bogus one (and anything after) must NOT contribute garbage
+        // IDs.
+        final goodAlpn = <int>[0x00, 0x03, 0x02, 0x68, 0x32]; // alpn "h2"
+        final extBlockBytes = <int>[
+          // ext 1: ALPN (0x0010), len 5
+          0x00, 0x10, 0x00, 0x05, ...goodAlpn,
+          // ext 2: type 0x00ff, declared len 0x0100 (256) — way past EOF
+          0x00, 0xff, 0x01, 0x00,
+        ];
+        final hello = _buildClientHelloRaw(extBlockBytes);
+        final parsed = const TlsClientHelloParser().parse(hello);
+        expect(parsed, isNotNull);
+        expect(
+          parsed!.extensionIds,
+          [0x0010],
+          reason: 'only the well-formed extension should be recorded',
+        );
+      },
+    );
+  });
+}
+
+/// Like [_buildClientHello] but takes a pre-built extension *bytes* blob
+/// so tests can construct deliberately malformed extension blocks that
+/// the high-level builder wouldn't produce.
+Uint8List _buildClientHelloRaw(List<int> extBytes) {
+  final extBlock = <int>[];
+  if (extBytes.isNotEmpty) {
+    extBlock.addAll([(extBytes.length >> 8) & 0xff, extBytes.length & 0xff]);
+    extBlock.addAll(extBytes);
+  }
+  final body = <int>[];
+  // client_version
+  body.addAll([0x03, 0x03]);
+  // random (32 bytes)
+  body.addAll(List<int>.filled(32, 0));
+  // session id length + data (0)
+  body.add(0);
+  // cipher suites len + one suite
+  body.addAll([0x00, 0x02, 0x13, 0x01]);
+  // compression methods len + null
+  body.addAll([0x01, 0x00]);
+  // extensions
+  body.addAll(extBlock);
+
+  // Handshake header: type=1 (ClientHello), 3-byte length
+  final handshake = <int>[1];
+  handshake.addAll([
+    (body.length >> 16) & 0xff,
+    (body.length >> 8) & 0xff,
+    body.length & 0xff,
+  ]);
+  handshake.addAll(body);
+
+  // Record header: type=22 (Handshake), record_version=0x0301, 2-byte len
+  final record = <int>[22, 0x03, 0x01];
+  record.addAll([(handshake.length >> 8) & 0xff, handshake.length & 0xff]);
+  record.addAll(handshake);
+
+  return Uint8List.fromList(record);
 }
