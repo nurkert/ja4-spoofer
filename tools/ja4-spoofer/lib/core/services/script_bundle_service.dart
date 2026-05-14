@@ -1,3 +1,4 @@
+import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -56,8 +57,19 @@ class ScriptBundleService {
         data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
       );
 
-      if (relative.endsWith('.sh') || relative.endsWith('.py')) {
-        await Process.run('chmod', ['+x', outFile.path]);
+      if ((Platform.isLinux || Platform.isMacOS) &&
+          (relative.endsWith('.sh') || relative.endsWith('.py'))) {
+        // Flutter asset I/O writes 0644. Without re-asserting the
+        // execute bit here, bash refuses to run apply_patches.sh on
+        // first launch after a fresh install. Skip on Windows where
+        // POSIX perms don't apply.
+        final result = await Process.run('chmod', ['+x', outFile.path]);
+        if (result.exitCode != 0) {
+          developer.log(
+            'chmod +x failed for ${outFile.path}: ${result.stderr}',
+            name: 'ScriptBundleService',
+          );
+        }
       }
     }
 
