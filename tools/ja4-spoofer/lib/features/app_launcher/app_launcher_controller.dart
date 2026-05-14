@@ -344,11 +344,31 @@ class AppLauncherController extends ChangeNotifier {
     try {
       final running = await startScript();
       app.runningScript = running;
-      app.stdoutSub = running.stdout.listen((t) => _appendAppOutput(app, t));
-      app.stderrSub = running.stderr.listen((t) => _appendAppOutput(app, t));
+      // `process.exitCode` resolves when the OS reaps the child, but
+      // buffered stdout/stderr can still be in flight to our listeners
+      // at that moment. Track stream completion separately so the tail
+      // of long builds (Chromium emits hundreds of lines after its final
+      // status message) lands in the output buffer before we tear down
+      // the subscriptions.
+      final stdoutDone = Completer<void>();
+      final stderrDone = Completer<void>();
+      app.stdoutSub = running.stdout.listen(
+        (t) => _appendAppOutput(app, t),
+        onDone: () {
+          if (!stdoutDone.isCompleted) stdoutDone.complete();
+        },
+      );
+      app.stderrSub = running.stderr.listen(
+        (t) => _appendAppOutput(app, t),
+        onDone: () {
+          if (!stderrDone.isCompleted) stderrDone.complete();
+        },
+      );
       notifyListeners();
 
       final code = await running.process.exitCode;
+      await stdoutDone.future;
+      await stderrDone.future;
       await app.stdoutSub?.cancel();
       await app.stderrSub?.cancel();
       app.runningScript = null;

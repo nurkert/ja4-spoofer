@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -121,4 +122,84 @@ void main() {
     expect(launcherService.lastArgs, contains('--profile-dir'));
     expect(launcherService.lastArgs, contains('--kill-existing'));
   });
+
+  test('smartLaunch drains stdout emitted after process exit', () async {
+    // Regression: long Chromium/Firefox builds were losing the tail of
+    // their stdout because the controller awaited `process.exitCode`
+    // before its listeners had drained buffered output. Inject a
+    // launcher whose stdout stream deliberately emits data AFTER the
+    // child has exited; the controller must wait for stream onDone.
+    final tempDir = Directory.systemTemp.createTempSync('ja4_drain_');
+    addTearDown(() => tempDir.deleteSync(recursive: true));
+
+    final launchScript = File('${tempDir.path}/launch.sh')
+      ..writeAsStringSync('#!/bin/sh\nexit 0\n');
+
+    final stdoutCtl = StreamController<String>();
+    final stderrCtl = StreamController<String>.broadcast();
+
+    final launcherService = _DelayedStreamLauncherService(
+      stdoutCtl: stdoutCtl,
+      stderrCtl: stderrCtl,
+    );
+    final controller = AppLauncherController(launcherService: launcherService);
+
+    final descriptor = AppDescriptor(
+      appId: 'curl-openssl-ja4',
+      metadata: const AppDescriptorMetadata(name: 'curl (OpenSSL)'),
+      build: const AppBuildConfig(script: 'build.sh', builtBinaryPaths: []),
+      launch: AppLaunchConfig(
+        script: launchScript.path,
+        profileFormat: 'openssl',
+        runtime: const AppLaunchRuntimeConfig(kind: AppRuntimeKind.cli),
+      ),
+    );
+    final app = AppState(
+      descriptor: descriptor,
+      buildState: AppBuildState.built,
+    );
+    controller.apps = [app];
+
+    // Schedule a late stdout emission: arrives after process.exitCode
+    // already resolved. Without the drain fix, the controller would
+    // return before receiving this last line.
+    unawaited(
+      Future<void>.delayed(const Duration(milliseconds: 50)).then((_) async {
+        stdoutCtl.add('late stdout chunk\n');
+        await stdoutCtl.close();
+        await stderrCtl.close();
+      }),
+    );
+
+    await controller.smartLaunch(app);
+
+    expect(app.output, contains('late stdout chunk'));
+  });
+}
+
+class _DelayedStreamLauncherService extends ScriptLauncherService {
+  _DelayedStreamLauncherService({
+    required this.stdoutCtl,
+    required this.stderrCtl,
+  });
+
+  final StreamController<String> stdoutCtl;
+  final StreamController<String> stderrCtl;
+
+  @override
+  Future<RunningScript> start({
+    required String scriptPath,
+    required List<String> args,
+    Map<String, String>? environment,
+  }) async {
+    // Real Process that exits immediately so `process.exitCode` resolves
+    // promptly. The interesting stream timing happens on the stdout
+    // controller we own.
+    final process = await Process.start('/bin/sh', ['-c', 'exit 0']);
+    return RunningScript(
+      process: process,
+      stdout: stdoutCtl.stream,
+      stderr: stderrCtl.stream,
+    );
+  }
 }
