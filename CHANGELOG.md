@@ -4,6 +4,39 @@ All notable changes to JA4 Spoofer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-05-14
+
+### Added
+
+- New upstream drift check workflow validates BoringSSL, NSS, and OpenSSL
+  patches against their pinned base refs.
+- `scripts/apply_patches.sh` supports a dry-run/check mode so patch drift can
+  be detected without mutating the local source tree.
+- The app now caches IANA registry CSVs locally, making registry-backed screens
+  usable when the network is unavailable after an initial fetch.
+- App settings now carry a `schema_version`, and writes use the new atomic file
+  helper to avoid partially-written profile/settings files.
+
+### Changed
+
+- Release notes now come directly from the matching `CHANGELOG.md` section.
+- CI covers formatting, analysis, Flutter tests, shell linting, coverage
+  generation, and golden-test scaffolding.
+- `shadcn_ui` was bumped to `0.54.0`.
+
+### Fixed
+
+- Launcher output is fully drained before process exit handling, avoiding lost
+  logs in the app console.
+- App-shell initialization is serialized, and the capture throttle timer is
+  cancelled cleanly during disposal.
+- TLS ClientHello parsing now rejects invalid TLS version ordering and
+  truncated ClientHello data.
+- Bundled script extraction logs chmod failures instead of silently ignoring
+  permission problems.
+- Profile IDs are sanitized before file writes to prevent invalid or unsafe
+  profile paths.
+
 ## [1.3.2] — 2026-05-13
 
 ### Fixed
@@ -123,6 +156,7 @@ Initial public release.
 - Seed profiles for Safari, Brave, Tor, Zen, Apple Mail, curl, Chromium,
   Firefox.
 
+[1.4.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.4.0
 [1.3.2]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.3.2
 [1.3.1]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.3.1
 [1.3.0]: https://github.com/nurkert/ja4-spoofer/releases/tag/v1.3.0
