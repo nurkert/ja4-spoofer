@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../models/app_settings.dart';
+import '../utils/atomic_file.dart';
 
 /// Persists [AppSettings] to ~/.ja4-spoofer/settings.json.
 class SettingsService {
@@ -28,11 +29,6 @@ class SettingsService {
   }
 
   Future<void> save(AppSettings settings) async {
-    final file = File(_settingsPath);
-    if (!file.parent.existsSync()) {
-      file.parent.createSync(recursive: true);
-    }
-    final json = const JsonEncoder.withIndent('  ').convert(settings.toJson());
-    await file.writeAsString(json);
+    await writeJsonAtomic(File(_settingsPath), settings.toJson());
   }
 }

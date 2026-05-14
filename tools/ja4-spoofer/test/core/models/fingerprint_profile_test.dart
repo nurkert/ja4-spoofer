@@ -188,9 +188,27 @@ void main() {
       expect(p.metadata.source, 'manual');
     });
 
-    test('fromJson missing profile_id → unknown', () {
-      final p = FingerprintProfile.fromJson({});
-      expect(p.profileId, 'unknown');
+    test('fromJson missing profile_id → throws FormatException', () {
+      // Reject profiles without an ID rather than silently writing them
+      // to disk as "unknown.json" — that previously masked partially
+      // written / hand-crafted imports and also created a path-traversal
+      // surface (a profile_id of "../escape" would have escaped the
+      // profiles directory).
+      expect(
+        () => FingerprintProfile.fromJson({}),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('fromJson rejects path-traversal in profile_id', () {
+      expect(
+        () => FingerprintProfile.fromJson({'profile_id': '../escape'}),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => FingerprintProfile.fromJson({'profile_id': 'a/b'}),
+        throwsA(isA<FormatException>()),
+      );
     });
 
     test('toJson includes schema_version=1', () {

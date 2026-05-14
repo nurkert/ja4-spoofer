@@ -67,5 +67,14 @@ void main() {
         isTrue,
       );
     });
+
+    test('leaves no .tmp file after a successful save', () async {
+      await service.save(const AppSettings(repoPath: '/x'));
+      final leftovers = tempDir
+          .listSync()
+          .where((e) => e.path.endsWith('.tmp'))
+          .toList();
+      expect(leftovers, isEmpty);
+    });
   });
 }

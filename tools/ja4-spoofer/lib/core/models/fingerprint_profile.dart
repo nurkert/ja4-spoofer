@@ -1,5 +1,7 @@
 import 'package:flutter/foundation.dart';
 
+import '../utils/atomic_file.dart';
+
 /// Metadata attached to a stored fingerprint profile.
 @immutable
 class FingerprintProfileMetadata {
@@ -217,7 +219,10 @@ class FingerprintProfile {
     final tlsJson = inputs['tls_client_hello'] as Map<String, dynamic>? ?? {};
     final meta = json['metadata'] as Map<String, dynamic>? ?? {};
     return FingerprintProfile(
-      profileId: json['profile_id'] as String? ?? 'unknown',
+      // Reject any ID that contains separators or shell metachars before it
+      // can be used as a filename; protects ProfileService.save/delete
+      // against `../escape` and similar path-traversal payloads in imports.
+      profileId: sanitizeProfileId(json['profile_id'] as String? ?? ''),
       metadata: FingerprintProfileMetadata.fromJson(meta),
       inputs: TlsClientHelloInputs.fromJson(tlsJson),
     );
