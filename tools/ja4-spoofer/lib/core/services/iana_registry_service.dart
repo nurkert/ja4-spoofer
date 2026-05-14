@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:csv/csv.dart';
@@ -7,6 +9,11 @@ import 'package:flutter/services.dart';
 import '../models/app_settings.dart';
 import '../models/registry_bundle.dart';
 import '../models/registry_item.dart';
+
+/// Pluggable HTTP fetcher so tests can inject a deterministic responder
+/// without round-tripping through `dart:io`. Production code uses the
+/// default which talks to `HttpClient` with the existing 12/20s timeouts.
+typedef IanaHttpFetcher = Future<String> Function(Uri url);
 
 /// Loads TLS registries from one of three sources, picked by the user in
 /// Settings:
@@ -18,7 +25,19 @@ import '../models/registry_item.dart';
 /// * [IanaSource.disabled] — returns the empty bundle. No names are
 ///   resolved anywhere; pickers and selection rows fall back to hex IDs.
 class IanaRegistryService {
-  const IanaRegistryService();
+  IanaRegistryService({IanaHttpFetcher? fetcher, String? cacheDir})
+    : _fetcher = fetcher ?? _defaultFetcher,
+      _cacheDir = cacheDir ?? _defaultCacheDir();
+
+  final IanaHttpFetcher _fetcher;
+  final String _cacheDir;
+
+  static const Duration _cacheTtl = Duration(days: 7);
+
+  static String _defaultCacheDir() {
+    final home = Platform.environment['HOME'] ?? '.';
+    return '$home/.ja4-spoofer/cache/iana';
+  }
 
   static const _bundledCipherCsv = 'assets/iana/tls-parameters-4.csv';
   static const _bundledExtensionCsv =
@@ -87,15 +106,72 @@ class IanaRegistryService {
 
   Future<RegistryBundle> _loadOnline() async {
     final results = await Future.wait<String>([
-      _fetchText(_onlineCipherUrl),
-      _fetchText(_onlineExtensionUrl),
-      _fetchText(_onlineSignatureUrl),
+      _fetchCached(_onlineCipherUrl),
+      _fetchCached(_onlineExtensionUrl),
+      _fetchCached(_onlineSignatureUrl),
     ]);
     return _bundleFromCsv(
       cipherCsv: results[0],
       extensionCsv: results[1],
       signatureCsv: results[2],
     );
+  }
+
+  /// Returns the CSV body for [url], using a 7-day on-disk cache. On a
+  /// cache miss (or stale entry) tries the network; if that fails and a
+  /// stale cache exists, returns it with a warning. Otherwise rethrows
+  /// so [load]'s top-level catch can fall through to the bundled
+  /// snapshot.
+  Future<String> _fetchCached(String url) async {
+    final cacheFile = File('$_cacheDir/${_cacheFilename(url)}');
+    final fresh = _isFresh(cacheFile);
+    if (fresh) {
+      try {
+        return await cacheFile.readAsString();
+      } catch (_) {
+        // Treat as miss.
+      }
+    }
+    try {
+      final body = await _fetcher(Uri.parse(url));
+      await _writeCache(cacheFile, body);
+      return body;
+    } catch (e) {
+      if (cacheFile.existsSync()) {
+        developer.log(
+          'IANA fetch for $url failed ($e); serving stale cache.',
+          name: 'IanaRegistryService',
+        );
+        return await cacheFile.readAsString();
+      }
+      rethrow;
+    }
+  }
+
+  bool _isFresh(File cacheFile) {
+    if (!cacheFile.existsSync()) return false;
+    final age = DateTime.now().difference(cacheFile.lastModifiedSync());
+    return age < _cacheTtl;
+  }
+
+  Future<void> _writeCache(File cacheFile, String body) async {
+    try {
+      final parent = cacheFile.parent;
+      if (!parent.existsSync()) parent.createSync(recursive: true);
+      await cacheFile.writeAsString(body, flush: true);
+    } catch (e) {
+      developer.log(
+        'IANA cache write failed for ${cacheFile.path}: $e',
+        name: 'IanaRegistryService',
+      );
+    }
+  }
+
+  String _cacheFilename(String url) {
+    // Hand-rolled basename: every IANA URL ends with the CSV's natural
+    // filename, so this stays stable across the three sources.
+    final last = url.split('/').last;
+    return last.isEmpty ? 'unknown.csv' : last;
   }
 
   RegistryBundle _bundleFromCsv({
@@ -208,23 +284,21 @@ class IanaRegistryService {
     }
     return int.tryParse(value);
   }
+}
 
-  Future<String> _fetchText(String url) async {
-    final client = HttpClient();
-    client.connectionTimeout = const Duration(seconds: 12);
-    try {
-      final request = await client.getUrl(Uri.parse(url));
-      request.headers.set(HttpHeaders.userAgentHeader, 'ja4_spoofer/1.0');
-      final response = await request.close().timeout(
-        const Duration(seconds: 20),
-      );
-      if (response.statusCode != HttpStatus.ok) {
-        throw HttpException('HTTP ${response.statusCode} for $url');
-      }
-      return await utf8.decoder.bind(response).join();
-    } finally {
-      client.close(force: true);
+Future<String> _defaultFetcher(Uri url) async {
+  final client = HttpClient();
+  client.connectionTimeout = const Duration(seconds: 12);
+  try {
+    final request = await client.getUrl(url);
+    request.headers.set(HttpHeaders.userAgentHeader, 'ja4_spoofer/1.0');
+    final response = await request.close().timeout(const Duration(seconds: 20));
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException('HTTP ${response.statusCode} for $url');
     }
+    return await utf8.decoder.bind(response).join();
+  } finally {
+    client.close(force: true);
   }
 }
 

@@ -7,7 +7,7 @@ import 'package:ja4_spoofer/core/utils/profile_args.dart';
 import 'package:ja4_spoofer/features/configurator/configurator_controller.dart';
 
 class _FakeRegistryService extends IanaRegistryService {
-  const _FakeRegistryService(this.bundle);
+  _FakeRegistryService(this.bundle);
 
   final RegistryBundle bundle;
 

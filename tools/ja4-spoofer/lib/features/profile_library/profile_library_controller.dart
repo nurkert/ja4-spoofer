@@ -30,7 +30,7 @@ class ProfileLibraryController extends ChangeNotifier {
   final ProfileService _service;
   final SettingsService _settingsService;
   final ProfileCatalogController _profileCatalogController;
-  static const _ianaService = IanaRegistryService();
+  static final IanaRegistryService _ianaService = IanaRegistryService();
   final CompatibilityChecker _checker = const CompatibilityChecker();
 
   /// Source for IANA name resolution. Disabled = hex IDs only.
