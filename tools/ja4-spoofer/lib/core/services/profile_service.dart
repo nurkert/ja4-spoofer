@@ -7,6 +7,7 @@ import 'package:yaml/yaml.dart';
 
 import '../models/built_in_profiles.dart';
 import '../models/fingerprint_profile.dart';
+import '../utils/atomic_file.dart';
 
 /// Persists and loads FCS-compatible fingerprint profiles.
 ///
@@ -71,19 +72,17 @@ class ProfileService {
   }
 
   Future<void> save(FingerprintProfile profile) async {
-    final dir = Directory(profilesDir);
-    if (!dir.existsSync()) dir.createSync(recursive: true);
-
-    final file = File('$profilesDir/${profile.profileId}.json');
-    final json = const JsonEncoder.withIndent('  ').convert(profile.toJson());
-    await file.writeAsString(json);
+    final safeId = sanitizeProfileId(profile.profileId);
+    final file = File('$profilesDir/$safeId.json');
+    await writeJsonAtomic(file, profile.toJson());
   }
 
   Future<void> delete(String profileId) async {
     // Built-in profiles cannot be deleted.
     if (builtInProfiles.any((p) => p.profileId == profileId)) return;
 
-    final file = File('$profilesDir/$profileId.json');
+    final safeId = sanitizeProfileId(profileId);
+    final file = File('$profilesDir/$safeId.json');
     if (file.existsSync()) {
       await file.delete();
     }

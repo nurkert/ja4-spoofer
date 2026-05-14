@@ -95,6 +95,26 @@ void main() {
       expect(loaded.length, builtInProfiles.length + 1);
       expect(loaded.any((p) => p.profileId == 'test-1'), isTrue);
     });
+
+    test('rejects path-traversal profile_id at save', () async {
+      final bad = FingerprintProfile(
+        profileId: '../escape',
+        metadata: const FingerprintProfileMetadata(name: 'Bad'),
+        inputs: const TlsClientHelloInputs(),
+      );
+      await expectLater(service.save(bad), throwsA(isA<FormatException>()));
+      // No file should have been created above profilesDir.
+      expect(File('${tempDir.path}/../escape.json').existsSync(), isFalse);
+    });
+
+    test('leaves no .tmp file after a successful save', () async {
+      await service.save(_makeProfile(id: 'atomic-1', name: 'A'));
+      final leftovers = tempDir
+          .listSync()
+          .where((e) => e.path.endsWith('.tmp'))
+          .toList();
+      expect(leftovers, isEmpty);
+    });
   });
 
   group('ProfileService.delete', () {
