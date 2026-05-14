@@ -96,6 +96,10 @@ class Ja4CaptureController extends ChangeNotifier {
       return;
     }
     notifyListeners();
+    // Cancel any prior (already-fired but still-referenced) timer before
+    // reassigning. Without this, fast successive calls could leak Timer
+    // instances whose callbacks would later run on a disposed controller.
+    _throttleTimer?.cancel();
     _throttleTimer = Timer(_throttleInterval, () {
       if (_pendingNotify && !_disposed) {
         _pendingNotify = false;

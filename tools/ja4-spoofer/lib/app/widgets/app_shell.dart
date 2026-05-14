@@ -172,35 +172,27 @@ class _AppShellState extends State<AppShell> {
       _profileLibraryController = profileLibraryController;
     });
 
-    unawaited(
-      launcherController
-          .loadApps()
-          .then((_) {
-            if (!mounted) return;
-            // 5. QuickLaunchController — after apps are loaded
-            final quickLaunchController = QuickLaunchController(
-              apps: launcherController.apps,
-              configuratorController: configuratorController,
-              profileCatalogController: profileCatalogController,
-            );
-            setState(() => _quickLaunchController = quickLaunchController);
-            unawaited(
-              profileCatalogController
-                  .load()
-                  .then((_) {
-                    if (!mounted) return Future<void>.value();
-                    return quickLaunchController
-                        .restoreSelectionIntoConfigurator();
-                  })
-                  .catchError((Object e, StackTrace st) {
-                    _reportInitError(e, st);
-                  }),
-            );
-          })
-          .catchError((Object e, StackTrace st) {
-            _reportInitError(e, st);
-          }),
-    );
+    // Linearised init: apps → quick-launch controller → profile catalog →
+    // restore selection. A single try/catch funnels every failure through
+    // `_reportInitError` — the previous nested `.then().catchError()`
+    // pair let inner failures slip past the outer handler.
+    unawaited(() async {
+      try {
+        await launcherController.loadApps();
+        if (!mounted) return;
+        final quickLaunchController = QuickLaunchController(
+          apps: launcherController.apps,
+          configuratorController: configuratorController,
+          profileCatalogController: profileCatalogController,
+        );
+        setState(() => _quickLaunchController = quickLaunchController);
+        await profileCatalogController.load();
+        if (!mounted) return;
+        await quickLaunchController.restoreSelectionIntoConfigurator();
+      } catch (e, st) {
+        _reportInitError(e, st);
+      }
+    }());
 
     // Load registries once here, not on every tab visit. Honour the
     // ianaSource privacy choice: bundled snapshot, online fetch, or off.
