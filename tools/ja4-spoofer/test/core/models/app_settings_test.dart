@@ -73,6 +73,56 @@ void main() {
       expect(j['iana_source'], 'online');
       expect(j['load_remote_icons'], isFalse);
     });
+
+    test('always emits schema_version=1', () {
+      expect(const AppSettings().toJson()['schema_version'], 1);
+      const populated = AppSettings(
+        repoPath: '/x',
+        ianaSource: IanaSource.online,
+      );
+      expect(populated.toJson()['schema_version'], 1);
+    });
+  });
+
+  group('AppSettings.fromJson schema_version', () {
+    test('reads v1 schema normally', () {
+      final s = AppSettings.fromJson({
+        'schema_version': 1,
+        'repo_path': '/repo',
+        'iana_source': 'online',
+        'load_remote_icons': false,
+      });
+      expect(s.repoPath, '/repo');
+      expect(s.ianaSource, IanaSource.online);
+      expect(s.loadRemoteIcons, isFalse);
+    });
+
+    test('legacy file without schema_version still parses (v0 path)', () {
+      // Pre-schema_version persistence: only `show_iana_names` existed.
+      // Migration path is exercised by other tests; here we just verify
+      // that absence of schema_version does NOT throw.
+      final s = AppSettings.fromJson({
+        'repo_path': '/legacy',
+        'show_iana_names': true,
+      });
+      expect(s.repoPath, '/legacy');
+      expect(s.ianaSource, IanaSource.online);
+    });
+
+    test('future schema_version=99 parses best-effort, does not throw', () {
+      // A newer app wrote unknown fields; we drop them and parse what
+      // we recognize. Important: the load must NOT throw, otherwise the
+      // older app silently resets the user's settings on downgrade.
+      final s = AppSettings.fromJson({
+        'schema_version': 99,
+        'repo_path': '/from-future',
+        'iana_source': 'bundled',
+        'load_remote_icons': true,
+        'some_new_field_we_dont_know': 'x',
+      });
+      expect(s.repoPath, '/from-future');
+      expect(s.ianaSource, IanaSource.bundled);
+    });
   });
 
   group('AppSettings.copyWith', () {
