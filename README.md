@@ -6,7 +6,6 @@
 
 [![CI](https://github.com/nurkert/ja4-spoofer/actions/workflows/ci.yml/badge.svg)](https://github.com/nurkert/ja4-spoofer/actions/workflows/ci.yml)
 [![Release](https://github.com/nurkert/ja4-spoofer/actions/workflows/release.yml/badge.svg)](https://github.com/nurkert/ja4-spoofer/actions/workflows/release.yml)
-[![codecov](https://codecov.io/gh/nurkert/ja4-spoofer/branch/main/graph/badge.svg)](https://codecov.io/gh/nurkert/ja4-spoofer)
 [![Latest release](https://img.shields.io/github/v/release/nurkert/ja4-spoofer)](https://github.com/nurkert/ja4-spoofer/releases)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 
