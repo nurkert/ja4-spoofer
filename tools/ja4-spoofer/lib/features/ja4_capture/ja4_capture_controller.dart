@@ -23,7 +23,7 @@ class Ja4CaptureController extends ChangeNotifier {
   final Ja4CaptureServer _server;
   final ProfileCatalogController _profileCatalogController;
   final SettingsService _settingsService = SettingsService();
-  static const _ianaService = IanaRegistryService();
+  static final IanaRegistryService _ianaService = IanaRegistryService();
 
   bool get serverRunning => _server.isRunning;
   int get port => _server.port;

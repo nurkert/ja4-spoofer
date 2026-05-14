@@ -22,7 +22,7 @@ class ConfiguratorController extends ChangeNotifier {
   ConfiguratorController({
     IanaRegistryService? registryService,
     ProfileService? profileService,
-  }) : _registryService = registryService ?? const IanaRegistryService(),
+  }) : _registryService = registryService ?? IanaRegistryService(),
        _profileService = profileService ?? ProfileService() {
     _initializeControllers();
   }
