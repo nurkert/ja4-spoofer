@@ -1,4 +1,11 @@
+import 'dart:developer' as developer;
+
 import 'package:flutter/foundation.dart';
+
+/// Current `settings.json` schema version. Increment whenever the on-disk
+/// shape changes in a way `fromJson` can't read transparently — and add a
+/// migration branch.
+const int kAppSettingsSchemaVersion = 1;
 
 /// Where the GUI sources IANA TLS registry data from.
 ///
@@ -102,13 +109,27 @@ class AppSettings {
   }
 
   factory AppSettings.fromJson(Map<String, dynamic> json) {
+    final v = json['schema_version'];
+    if (v is int && v > kAppSettingsSchemaVersion) {
+      // Downgrade scenario: a newer app wrote fields we don't know about.
+      // Parse what we can; unknown fields are silently dropped. The next
+      // save will overwrite them — accept that risk to avoid bricking
+      // the older app entirely.
+      developer.log(
+        'settings.json schema_version=$v is newer than supported '
+        '($kAppSettingsSchemaVersion); parsing best-effort.',
+        name: 'AppSettings',
+      );
+    }
+
     final IanaSource source;
     if (json.containsKey('iana_source')) {
       source = _parseIanaSource(json['iana_source'] as String?);
     } else if (json.containsKey('show_iana_names')) {
-      // Legacy boolean: true → online (user opted into fetching), false →
-      // disabled (user opted out of resolution). New "bundled" default
-      // only applies to fresh installs.
+      // Legacy boolean (pre-schema_version files): true → online (user
+      // opted into fetching), false → disabled (user opted out of
+      // resolution). New "bundled" default only applies to fresh
+      // installs.
       source = (json['show_iana_names'] as bool? ?? false)
           ? IanaSource.online
           : IanaSource.disabled;
@@ -124,6 +145,7 @@ class AppSettings {
   }
 
   Map<String, dynamic> toJson() => {
+    'schema_version': kAppSettingsSchemaVersion,
     if (repoPath != null) 'repo_path': repoPath,
     if (quickLaunchProfileId != null)
       'quick_launch_profile_id': quickLaunchProfileId,
