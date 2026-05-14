@@ -15,7 +15,7 @@ dependencies:
   shadcn_ui: ^0.54.0
   csv: ^7.1.0
   yaml: ^3.1.2
-  file_picker: ^8.1.7
+  file_picker: ^11.0.2
   cached_network_image: ^3.4.1
   flutter_cache_manager: ^3.4.1
   flutter_svg: ^2.0.17
