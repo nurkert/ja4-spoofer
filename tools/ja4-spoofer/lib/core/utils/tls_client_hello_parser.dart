@@ -1,3 +1,4 @@
+import 'dart:developer' as developer;
 import 'dart:typed_data';
 
 /// GREASE values defined by RFC 8701.
@@ -93,8 +94,13 @@ class ParsedClientHello {
     final data = extensionData[0x002b];
     if (data == null || data.isEmpty) return [];
     final length = data[0]; // 1-byte length prefix in ClientHello
+    // Fail closed on truncated extensions: if the declared length runs
+    // past the buffer we'd otherwise return a partial list and the
+    // caller wouldn't know its data was lying. Treat as malformed and
+    // surface an empty list.
+    if (1 + length > data.length) return const [];
     final versions = <int>[];
-    for (var i = 1; i + 1 < data.length && i < 1 + length; i += 2) {
+    for (var i = 1; i + 1 < 1 + length; i += 2) {
       versions.add((data[i] << 8) | data[i + 1]);
     }
     return versions;
@@ -230,12 +236,22 @@ class TlsClientHelloParser {
         final extLen = (data[offset] << 8) | data[offset + 1];
         offset += 2;
 
-        extensionIds.add(extType);
-        if (offset + extLen <= data.length) {
-          extensionData[extType] = Uint8List.fromList(
-            data.sublist(offset, offset + extLen),
+        if (offset + extLen > data.length || offset + extLen > extEnd) {
+          // Extension claims to be longer than the buffer (or longer
+          // than the announced extension block). Stop parsing — the
+          // remaining bytes can't be trusted to be aligned, and silently
+          // advancing `offset` here used to produce garbage IDs.
+          developer.log(
+            'truncated extension type=0x${extType.toRadixString(16)} '
+            'declared_len=$extLen remaining=${data.length - offset}',
+            name: 'TlsClientHelloParser',
           );
+          break;
         }
+        extensionIds.add(extType);
+        extensionData[extType] = Uint8List.fromList(
+          data.sublist(offset, offset + extLen),
+        );
         offset += extLen;
       }
     }

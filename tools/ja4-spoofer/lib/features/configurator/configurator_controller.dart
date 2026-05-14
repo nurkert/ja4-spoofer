@@ -193,6 +193,13 @@ class ConfiguratorController extends ChangeNotifier {
   // ---------- Setters ----------
   void setTlsMin(String value) {
     tlsMin = value;
+    // Keep tlsMax >= tlsMin. A user moving the min above the current max
+    // (e.g. selects 1.3 while max is still 1.2) would otherwise persist
+    // an inverted range and emit a broken handshake config to the
+    // launcher. Clamp the max up so the relationship stays valid.
+    if (_versionRank(value) > _versionRank(tlsMax)) {
+      tlsMax = value;
+    }
     _setTlsStateSource(TlsStateSource.configurator, 'Manual TLS edit');
     _updateDirty();
     notifyListeners();
@@ -200,9 +207,30 @@ class ConfiguratorController extends ChangeNotifier {
 
   void setTlsMax(String value) {
     tlsMax = value;
+    // Mirror of setTlsMin: clamp tlsMin down to preserve min ≤ max.
+    if (_versionRank(value) < _versionRank(tlsMin)) {
+      tlsMin = value;
+    }
     _setTlsStateSource(TlsStateSource.configurator, 'Manual TLS edit');
     _updateDirty();
     notifyListeners();
+  }
+
+  /// Maps TLS version strings to a comparable rank. Empty / unknown maps
+  /// to -1 so an empty field never beats a populated one in the clamp.
+  static int _versionRank(String v) {
+    switch (v) {
+      case '1.0':
+        return 0;
+      case '1.1':
+        return 1;
+      case '1.2':
+        return 2;
+      case '1.3':
+        return 3;
+      default:
+        return -1;
+    }
   }
 
   void setSniMode(String value) {
