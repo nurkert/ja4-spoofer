@@ -25,6 +25,7 @@ class BrowserTile extends StatefulWidget {
     this.onMoveToConfigurator,
     this.onLaunchArgumentsChanged,
     this.onClearOutput,
+    this.onVerifyFingerprint,
   });
 
   final AppState app;
@@ -36,6 +37,9 @@ class BrowserTile extends StatefulWidget {
   final VoidCallback? onMoveToConfigurator;
   final void Function(AppState app, String value)? onLaunchArgumentsChanged;
   final void Function(AppState app)? onClearOutput;
+
+  /// Runs an independent wire measurement of the emitted fingerprint.
+  final void Function(AppState app)? onVerifyFingerprint;
 
   @override
   State<BrowserTile> createState() => _BrowserTileState();
@@ -255,8 +259,22 @@ class _BrowserTileState extends State<BrowserTile> {
           FingerprintVerdictPanel(
             enforcement: app.enforcement,
             verdict: app.dumpVerdict,
+            observation: app.wireObservation,
             isRunning: isRunning,
+            isMeasuring: app.measuring,
           ),
+          if (widget.onVerifyFingerprint != null &&
+              app.buildState == AppBuildState.built &&
+              !app.measuring)
+            Align(
+              alignment: Alignment.centerRight,
+              child: ShadButton.ghost(
+                size: ShadButtonSize.sm,
+                onPressed: () => widget.onVerifyFingerprint!(app),
+                leading: const Icon(LucideIcons.radar, size: 12),
+                child: const Text('Fingerprint messen'),
+              ),
+            ),
           // Output console
           if (app.output.isNotEmpty) ...[
             const SizedBox(height: 10),

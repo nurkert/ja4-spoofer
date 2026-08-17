@@ -33,6 +33,9 @@ The project currently targets:
   intact, naming what would deviate and why.
 - Post-launch verification that recomputes the JA4 from the library's readback
   of the emitted ClientHello and compares it against the selected profile.
+- An independent wire measurement: a local probe reads the ClientHello the
+  client really sends off a socket and compares its JA4 against the profile,
+  without trusting the library's own report.
 
 ## Responsible Use
 
@@ -168,6 +171,24 @@ Every launch is guarded on both sides:
 A launch that produces no dump at all is reported as unverified rather than as
 success: that is what happens when the started binary is not linked against the
 patched TLS library and silently sends its native fingerprint.
+
+**Fingerprint messen** runs the check that depends on nothing the library says
+about itself. It binds a loopback-only TLS sniffer on an ephemeral port, points
+the client at it once, reads the ClientHello straight off the socket and hashes
+it with the same JA4 implementation the profile is hashed with. The handshake is
+answered with a fatal alert and the client reports a TLS error — expected, the
+connection exists only to be measured.
+
+That measurement outranks both the forecast and the library's self-report, and
+it is the only place some deviations can surface at all. On OpenSSL the
+diagnostic dump echoes ALPN back from the request, so an ALPN drift is invisible
+there by construction; the same is true for any extension the stacks append
+behind your back, because they write the already-modified list back as the
+"requested" one.
+
+Only the patched build is launched. A stock browser is deliberately not used as
+a fallback — it ignores the JA4 environment entirely and would send its own
+fingerprint while the launcher reported success.
 
 <p align="center">
   <img src="assets/launcher.png" alt="Launch tab" width="100%">

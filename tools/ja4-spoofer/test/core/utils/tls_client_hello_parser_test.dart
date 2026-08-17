@@ -406,6 +406,70 @@ void main() {
       },
     );
   });
+
+  group('key_share and psk_key_exchange_modes', () {
+    // Both feed the wire-vs-profile comparison in the verification probe, so
+    // a silently truncated body must read as "nothing known" rather than as a
+    // partial list the caller would treat as a measurement.
+    ParsedClientHello parseWith(Map<int, List<int>> extensions) {
+      final blob = <int>[];
+      for (final entry in extensions.entries) {
+        blob.addAll([
+          (entry.key >> 8) & 0xff,
+          entry.key & 0xff,
+          (entry.value.length >> 8) & 0xff,
+          entry.value.length & 0xff,
+          ...entry.value,
+        ]);
+      }
+      final parsed = parser.parse(_buildClientHelloRaw(blob));
+      expect(parsed, isNotNull);
+      return parsed!;
+    }
+
+    test('reads key_share group ids in wire order', () {
+      // client_shares_length, then (group, key_len, key) entries.
+      final body = <int>[
+        0x00, 0x48, // client_shares_length: 2 entries x 36 bytes
+        0x00, 0x1d, 0x00, 0x20, ...List.filled(32, 0x41),
+        0x00, 0x17, 0x00, 0x20, ...List.filled(32, 0x42),
+      ];
+      expect(parseWith({0x0033: body}).keyShareGroups, [0x001d, 0x0017]);
+    });
+
+    test('a truncated key_share body yields an empty list', () {
+      // Declares 0x4c bytes of shares but carries far fewer.
+      final body = <int>[0x00, 0x4c, 0x00, 0x1d, 0x00, 0x20, 0x41];
+      expect(parseWith({0x0033: body}).keyShareGroups, isEmpty);
+    });
+
+    test('missing key_share yields an empty list', () {
+      expect(
+        parseWith({
+          0x0010: <int>[0x00, 0x00],
+        }).keyShareGroups,
+        isEmpty,
+      );
+    });
+
+    test('reads psk_key_exchange_modes', () {
+      expect(
+        parseWith({
+          0x002d: <int>[0x02, 0x00, 0x01],
+        }).pskKeyExchangeModes,
+        [0x00, 0x01],
+      );
+    });
+
+    test('a truncated psk_key_exchange_modes body yields an empty list', () {
+      expect(
+        parseWith({
+          0x002d: <int>[0x05, 0x01],
+        }).pskKeyExchangeModes,
+        isEmpty,
+      );
+    });
+  });
 }
 
 /// Like [_buildClientHello] but takes a pre-built extension *bytes* blob

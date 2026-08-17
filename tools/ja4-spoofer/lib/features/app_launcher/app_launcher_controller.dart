@@ -9,6 +9,7 @@ import '../../core/models/fingerprint_profile.dart';
 import '../../core/models/ja4_stack.dart';
 import '../../core/services/app_descriptor_service.dart';
 import '../../core/services/dump_watcher_service.dart';
+import '../../core/services/ja4_verification_probe.dart';
 import '../../core/services/patch_service.dart';
 import '../../core/services/script_launcher_service.dart';
 import '../../core/utils/fingerprint_enforcement.dart';
@@ -50,6 +51,14 @@ class AppState {
   /// Post-launch verdict: what the patched library reports it actually put on
   /// the wire. Null while no verified ClientHello has been observed yet.
   DumpVerdict? dumpVerdict;
+
+  /// Independent measurement of the emitted ClientHello, read off a socket by
+  /// the local probe rather than reported by the library. Outranks
+  /// [dumpVerdict] whenever both are present.
+  WireObservation? wireObservation;
+
+  /// True while a probe run is in flight.
+  bool measuring = false;
 
   /// Profile whose fingerprint the running process is supposed to carry.
   FingerprintProfile? launchedProfile;
@@ -386,6 +395,106 @@ class AppLauncherController extends ChangeNotifier {
   void dismissEnforcement(AppState app) {
     app.enforcementAwaitingDecision = false;
     notifyListeners();
+  }
+
+  /// Measures the fingerprint [app] actually emits and compares it against
+  /// [profile].
+  ///
+  /// This is the only check here that does not depend on the patched library
+  /// telling the truth about itself: a loopback sniffer reads the ClientHello
+  /// off the socket and hashes it with the same JA4 implementation the profile
+  /// is hashed with. On OpenSSL it is the only way to see an ALPN or cipher
+  /// drift at all, because that stack's dump echoes those values back from the
+  /// request instead of re-reading the wire.
+  ///
+  /// The client is started against `https://127.0.0.1:<port>/` and will report
+  /// a TLS error — the probe answers every ClientHello with a fatal alert. The
+  /// handshake is not the point; the ClientHello is.
+  Future<WireObservation?> verifyFingerprint(
+    AppState app,
+    FingerprintProfile profile, {
+    Ja4VerificationProbe probe = const Ja4VerificationProbe(),
+  }) async {
+    if (app.measuring || app.isRunning) return null;
+    if (app.buildState != AppBuildState.built) {
+      _appendAppOutput(app, '[ja4] cannot measure: build the target first\n');
+      return null;
+    }
+
+    final scriptPath = app.descriptor.launch.script;
+    if (!File(scriptPath).existsSync()) {
+      _appendAppOutput(app, '[error] launch script not found: $scriptPath\n');
+      return null;
+    }
+
+    app.measuring = true;
+    app.wireObservation = null;
+    refreshEnforcement(app, profile);
+    _appendAppOutput(app, '[ja4] measuring emitted ClientHello...\n');
+
+    try {
+      final observation = await probe.measure(
+        profile: profile,
+        launchClient: (probeUrl) async {
+          final args = [
+            ..._profileArgsForApp(app, profile),
+            ..._probeClientArgs(app, probeUrl),
+          ];
+          await _runScript(
+            app,
+            startScript: () =>
+                _launcherService.start(scriptPath: scriptPath, args: args),
+          );
+        },
+      );
+      app.wireObservation = observation;
+      _appendAppOutput(app, '[ja4] ${observation.headline}\n');
+      if (observation.observedJa4 != null) {
+        _appendAppOutput(
+          app,
+          '[ja4]   ausgewählt: ${observation.intendedJa4}\n'
+          '[ja4]   gemessen:   ${observation.observedJa4}\n',
+        );
+      }
+      for (final deviation in observation.deviations) {
+        _appendAppOutput(
+          app,
+          '[ja4]   ${deviation.field}: profil=${deviation.requested} '
+          'draht=${deviation.actual}\n',
+        );
+      }
+      return observation;
+    } finally {
+      app.measuring = false;
+      notifyListeners();
+    }
+  }
+
+  /// Arguments that point the client at the probe URL for one short request.
+  ///
+  /// Both runner scripts forward everything after `--` to the client itself,
+  /// so a browser receives the URL as its start page and curl receives it as
+  /// its request target.
+  List<String> _probeClientArgs(AppState app, String probeUrl) {
+    if (app.isCli) {
+      return [
+        '--',
+        '-sS',
+        '-o',
+        Platform.isWindows ? 'NUL' : '/dev/null',
+        '--max-time',
+        '15',
+        probeUrl,
+      ];
+    }
+    final tempProfileDir = Directory.systemTemp.createTempSync('ja4-probe-');
+    return [
+      '--profile-dir',
+      tempProfileDir.path,
+      '--kill-existing',
+      '--',
+      probeUrl,
+    ];
   }
 
   /// Single smart action: patches if needed, builds if needed, then launches.

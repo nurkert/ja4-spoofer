@@ -6,11 +6,19 @@
 BROWSER_NAME="Chromium"
 BROWSER_BIN_ENV_VAR="CHROMIUM_BIN"
 BROWSER_BIN_OPTION="--chromium-bin"
+# Only the locally built, patched Chromium is auto-discovered. A stock
+# /Applications/Chromium.app used to be the last candidate here, which meant a
+# missing or half-finished build silently fell through to the system browser:
+# it ignores BORINGSSL_JA4_CONFIG entirely and sends its own fingerprint while
+# the launcher reported success. Point --chromium-bin at another binary
+# deliberately if you really want one.
 BROWSER_SEARCH_PATHS=(
   "$HOME/chromium/src/out/ja4-stable/Chromium.app/Contents/MacOS/Chromium"
   "$HOME/chromium/src/out/ja4-stable/chrome"
-  "/Applications/Chromium.app/Contents/MacOS/Chromium"
 )
+# Binaries outside this prefix cannot have been produced by our build and are
+# flagged before launch.
+BROWSER_BUILD_PREFIX="$HOME/chromium/src/out/ja4-stable"
 BROWSER_CONFIG_ENV_VARS=("BORINGSSL_JA4_CONFIG")
 BROWSER_DUMP_ENV_VAR="BORINGSSL_JA4_DUMP"
 BROWSER_DEFAULT_CONFIG_OUT="/tmp/boringssl-ja4-run.conf"

@@ -106,6 +106,38 @@ class ParsedClientHello {
     return versions;
   }
 
+  /// Named groups carried in the key_share extension (0x0033), in wire order.
+  ///
+  /// Body layout: `client_shares_length(2)` followed by
+  /// `group(2) + key_exchange_length(2) + key_exchange` entries. Only the group
+  /// IDs are of interest here — comparing them against the requested
+  /// `key_share_groups` is how a run proves the stack actually generated the
+  /// shares that were asked for.
+  List<int> get keyShareGroups {
+    final data = extensionData[0x0033];
+    if (data == null || data.length < 2) return const [];
+    final listLength = (data[0] << 8) | data[1];
+    if (2 + listLength > data.length) return const [];
+    final groups = <int>[];
+    var offset = 2;
+    while (offset + 4 <= 2 + listLength) {
+      groups.add((data[offset] << 8) | data[offset + 1]);
+      final keyLength = (data[offset + 2] << 8) | data[offset + 3];
+      offset += 4 + keyLength;
+      if (offset > 2 + listLength) return groups;
+    }
+    return groups;
+  }
+
+  /// PSK key exchange modes (extension 0x002d): `length(1) + mode(1)[]`.
+  List<int> get pskKeyExchangeModes {
+    final data = extensionData[0x002d];
+    if (data == null || data.isEmpty) return const [];
+    final length = data[0];
+    if (1 + length > data.length) return const [];
+    return List<int>.from(data.sublist(1, 1 + length));
+  }
+
   // ---------------------------------------------------------------------------
   // Derived JA4 values
   // ---------------------------------------------------------------------------
