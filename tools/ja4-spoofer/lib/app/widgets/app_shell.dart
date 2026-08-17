@@ -199,6 +199,16 @@ class _AppShellState extends State<AppShell> {
     unawaited(
       configuratorController
           .loadRegistries(source: settingsController.settings.ianaSource)
+          .then((_) {
+            // Share the extension registry with the launcher so its pre-flight
+            // check can tell a registered extension from one the stacks can
+            // only emit as an empty synthetic stub. Until this lands the check
+            // skips that rule rather than guessing.
+            launcherController.knownExtensionIds = configuratorController
+                .extensionRegistry
+                .map((item) => item.id)
+                .toSet();
+          })
           .catchError((Object e, StackTrace st) {
             _reportInitError(e, st);
           }),

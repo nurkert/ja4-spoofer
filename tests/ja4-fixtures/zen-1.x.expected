@@ -1,6 +1,6 @@
 # Expected dump assertions for zen-1.x.conf.
 # ja4-fixture-format: v1
-expected_ja4=t13d1713h2_5b57614c22b0_283e4ebb28d0
+expected_ja4=t13d1716h2_5b57614c22b0_93c746dc12af
 mismatch_mask=0
 apply_ok=1
 require_requested_eq_final=cipher_suites,alpn,signature_algorithms,extension_order,supported_versions,supported_groups,key_share_groups,psk_key_exchange_modes

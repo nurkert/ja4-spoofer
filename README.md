@@ -29,7 +29,10 @@ The project currently targets:
 - Scriptable CLI launchers for Firefox, Chromium and curl.
 - A shared profile model for JA4-relevant ClientHello fields.
 - Seed profiles and fixtures for repeatable verification.
-- Diagnostic dumps that compare requested and effective wire values.
+- A pre-flight check that blocks a launch whose profile cannot reach the wire
+  intact, naming what would deviate and why.
+- Post-launch verification that recomputes the JA4 from the library's readback
+  of the emitted ClientHello and compares it against the selected profile.
 
 ## Responsible Use
 
@@ -141,9 +144,30 @@ In the GUI:
 3. Click an app action. The first run clones or initializes the required
    upstream source on the host, checks out the pinned base ref, applies the
    patch stack, builds the target and launches it. Later runs launch directly
-   while the patch stamp is still fresh.
+   while the patch stamp is still fresh. The stamp is written only after a
+   build that exited zero, and is keyed on the contents of `patches/<lib>/` plus
+   the build script — a failed build clears it, so the next launch rebuilds
+   instead of reusing a half-finished binary.
 
 **Launch** — Select a TLS profile and click an app to patch, build and launch it in one step. The button reads "Patch, Build & Launch" on the first run and shrinks to "Launch" once a fresh binary exists.
+
+Every launch is guarded on both sides:
+
+- **Before the start**, the selected profile is checked against the target's TLS
+  stack. If the ClientHello would provably differ from the profile — for
+  example because `extension_mode` is not `exact`, so the library keeps its own
+  extensions alongside yours — the launch stops and the dialog names the field,
+  the resulting deviation and its cause. Mechanical problems can be corrected
+  with one click.
+- **After the start**, the diagnostic dump the patched library writes for its
+  emitted ClientHello is read back, the JA4 is recomputed from the `final_*`
+  values and compared against the profile's JA4. The tile then states whether
+  the fingerprint you selected is the one that was sent, and lists any field
+  that drifted.
+
+A launch that produces no dump at all is reported as unverified rather than as
+success: that is what happens when the started binary is not linked against the
+patched TLS library and silently sends its native fingerprint.
 
 <p align="center">
   <img src="assets/launcher.png" alt="Launch tab" width="100%">

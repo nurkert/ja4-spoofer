@@ -39,13 +39,20 @@ class Ja4HashPreview {
     required List<int> extensions,
     required List<int> signatureAlgorithms,
     required List<String> alpnProtocols,
+    List<int> supportedVersions = const [],
     bool isQuic = false,
   }) {
     // Protocol: 't' for TCP, 'q' for QUIC
     final protocol = isQuic ? 'q' : 't';
 
-    // TLS version
-    final version = _tlsVersionCode(tlsMaxVersion);
+    // TLS version. Per the JA4 spec the version is the highest value in the
+    // supported_versions extension (GREASE excluded) whenever that extension
+    // is present; only without it does the negotiated/record version apply.
+    // A profile can legitimately carry tls_max=1.3 while pinning
+    // supported_versions=[771], and the wire would then say `t12`.
+    final version =
+        _versionCodeFromSupportedVersions(supportedVersions) ??
+        _tlsVersionCode(tlsMaxVersion);
 
     // SNI: 'd' = domain present, 'i' = no domain / IP / none
     final sni = switch (sniMode) {
@@ -99,6 +106,25 @@ class Ja4HashPreview {
     final prefix =
         '$protocol$version$sni${cipherCount.toString().padLeft(2, '0')}${extCount.toString().padLeft(2, '0')}$firstAlpn';
     return '${prefix}_${ciphersHash}_$extensionsHash';
+  }
+
+  /// Returns the two-digit JA4 version code for the highest non-GREASE entry
+  /// of a `supported_versions` list, or null when the list carries nothing
+  /// usable (empty, GREASE-only, or only unknown codepoints).
+  String? _versionCodeFromSupportedVersions(List<int> supportedVersions) {
+    const codes = {0x0304: '13', 0x0303: '12', 0x0302: '11', 0x0301: '10'};
+    String? best;
+    int bestValue = -1;
+    for (final version in supportedVersions) {
+      if (_greaseValues.contains(version)) continue;
+      final code = codes[version];
+      if (code == null) continue;
+      if (version > bestValue) {
+        bestValue = version;
+        best = code;
+      }
+    }
+    return best;
   }
 
   String _tlsVersionCode(String version) {
