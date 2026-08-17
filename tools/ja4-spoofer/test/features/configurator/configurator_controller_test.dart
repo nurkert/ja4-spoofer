@@ -203,4 +203,105 @@ void main() {
       reason: 'tlsMin should clamp down when max drops below it',
     );
   });
+
+  group('unedited JA4 fields survive a configurator round-trip', () {
+    // Regression: the configurator has no editor for these four, and used to
+    // rebuild the inputs without them. Opening a profile here silently
+    // stripped its supported_versions / supported_groups / key_share_groups /
+    // psk_key_exchange_modes, so the launched ClientHello stopped matching the
+    // profile the user thought they had selected.
+    const richInputs = TlsClientHelloInputs(
+      cipherSuites: [4865, 4866],
+      cipherMode: 'exact',
+      extensions: [0, 10, 16, 43, 45, 51],
+      extensionMode: 'exact',
+      signatureAlgorithms: [1027],
+      alpnProtocols: ['h2'],
+      supportedVersions: [772, 771],
+      supportedGroups: [29, 23],
+      keyShareGroups: [29],
+      pskKeyExchangeModes: [1],
+    );
+
+    const richProfile = FingerprintProfile(
+      profileId: 'rich',
+      metadata: FingerprintProfileMetadata(name: 'Rich'),
+      inputs: richInputs,
+    );
+
+    void expectPreserved(TlsClientHelloInputs actual) {
+      expect(actual.supportedVersions, richInputs.supportedVersions);
+      expect(actual.supportedGroups, richInputs.supportedGroups);
+      expect(actual.keyShareGroups, richInputs.keyShareGroups);
+      expect(actual.pskKeyExchangeModes, richInputs.pskKeyExchangeModes);
+    }
+
+    test('loadProfile preserves them', () {
+      final controller = ConfiguratorController(
+        registryService: _FakeRegistryService(
+          IanaRegistryService.fallbackBundle,
+        ),
+      );
+      controller.loadProfile(richProfile);
+      expectPreserved(controller.toTlsClientHelloInputs());
+    });
+
+    test('cloneIntoEditor preserves them', () {
+      final controller = ConfiguratorController(
+        registryService: _FakeRegistryService(
+          IanaRegistryService.fallbackBundle,
+        ),
+      );
+      controller.cloneIntoEditor(richProfile);
+      expectPreserved(controller.toTlsClientHelloInputs());
+    });
+
+    test('loadFromRandomRoll preserves them', () {
+      final controller = ConfiguratorController(
+        registryService: _FakeRegistryService(
+          IanaRegistryService.fallbackBundle,
+        ),
+      );
+      controller.loadFromRandomRoll(richProfile, suggestedName: 'Roll');
+      expectPreserved(controller.toTlsClientHelloInputs());
+    });
+
+    test('they reach the launch args', () {
+      final controller = ConfiguratorController(
+        registryService: _FakeRegistryService(
+          IanaRegistryService.fallbackBundle,
+        ),
+      );
+      controller.loadProfile(richProfile);
+      final args = profileToArgs(controller.toFingerprintProfile());
+      expect(args, containsAllInOrder(['--supported-versions', '772,771']));
+      expect(args, containsAllInOrder(['--supported-groups', '29,23']));
+      expect(args, containsAllInOrder(['--key-share-groups', '29']));
+      expect(args, containsAllInOrder(['--psk-key-exchange-modes', '1']));
+    });
+
+    test('a new profile starts without carried-over values', () {
+      final controller = ConfiguratorController(
+        registryService: _FakeRegistryService(
+          IanaRegistryService.fallbackBundle,
+        ),
+      );
+      controller.loadProfile(richProfile);
+      controller.resetToDefaults();
+      final inputs = controller.toTlsClientHelloInputs();
+      expect(inputs.supportedVersions, isEmpty);
+      expect(inputs.supportedGroups, isEmpty);
+      expect(inputs.keyShareGroups, isEmpty);
+      expect(inputs.pskKeyExchangeModes, isEmpty);
+    });
+  });
+
+  test('a full random roll is launchable without a pre-flight prompt', () {
+    final controller = ConfiguratorController(
+      registryService: _FakeRegistryService(IanaRegistryService.fallbackBundle),
+    );
+    controller.randomizeAll();
+    expect(controller.cipherMode, 'exact');
+    expect(controller.extensionMode, 'exact');
+  });
 }

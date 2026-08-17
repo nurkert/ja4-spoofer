@@ -110,6 +110,13 @@ class ConfiguratorController extends ChangeNotifier {
   /// Snapshot of TLS inputs at the time of loading — used for dirty tracking.
   TlsClientHelloInputs? _loadedInputsSnapshot;
 
+  /// JA4-relevant inputs the configurator has no editor for. They are carried
+  /// through every load/save round-trip verbatim; dropping them would silently
+  /// strip a profile's supported_versions, supported_groups, key_share_groups
+  /// and psk_key_exchange_modes the moment it is opened here, and the launched
+  /// ClientHello would no longer be the one the profile describes.
+  TlsClientHelloInputs _carriedInputs = const TlsClientHelloInputs();
+
   TlsStateSource tlsStateSource = TlsStateSource.configurator;
   String tlsStateSourceLabel = 'Manual defaults';
   // endregion
@@ -341,6 +348,7 @@ class ConfiguratorController extends ChangeNotifier {
     selectedSignatures = [];
     selectedAlpn = ['h2', 'http/1.1'];
 
+    _carriedInputs = const TlsClientHelloInputs();
     _loadedInputsSnapshot = null;
     isDirty = false;
     _setTlsStateSource(TlsStateSource.configurator, 'New Profile');
@@ -378,6 +386,7 @@ class ConfiguratorController extends ChangeNotifier {
     selectedExtensions = _dedupeIntSelection(inputs.extensions);
 
     _setTlsStateSource(TlsStateSource.randomize, suggestedName);
+    _carriedInputs = inputs;
     _loadedInputsSnapshot = null; // Random profile is "dirty by design".
     isDirty = true;
     notifyListeners();
@@ -403,6 +412,7 @@ class ConfiguratorController extends ChangeNotifier {
     _loadedSignaturesRaw = List<int>.from(inputs.signatureAlgorithms);
     selectedExtensions = _dedupeIntSelection(inputs.extensions);
 
+    _carriedInputs = inputs;
     _setTlsStateSource(TlsStateSource.profile, profile.metadata.name);
     _loadedInputsSnapshot = inputs;
     isDirty = false;
@@ -463,6 +473,7 @@ class ConfiguratorController extends ChangeNotifier {
     _loadedSignaturesRaw = List<int>.from(inputs.signatureAlgorithms);
     selectedExtensions = _dedupeIntSelection(inputs.extensions);
 
+    _carriedInputs = inputs;
     _loadedInputsSnapshot = null;
     isDirty = true;
     _setTlsStateSource(
@@ -486,6 +497,12 @@ class ConfiguratorController extends ChangeNotifier {
       sniMode: sniMode,
       cipherMode: cipherMode,
       extensionMode: extensionMode,
+      // Not editable here — preserved so a round-trip through the
+      // configurator cannot silently change what goes on the wire.
+      supportedVersions: _carriedInputs.supportedVersions,
+      supportedGroups: _carriedInputs.supportedGroups,
+      keyShareGroups: _carriedInputs.keyShareGroups,
+      pskKeyExchangeModes: _carriedInputs.pskKeyExchangeModes,
     );
   }
 
@@ -504,8 +521,11 @@ class ConfiguratorController extends ChangeNotifier {
     final versions = randomizeTlsVersions(_random);
     enableGrease = '0';
     enablePermutation = '0';
-    cipherMode = null;
-    extensionMode = null;
+    // A full random roll produces a concrete list for both, so exact mode is
+    // the only setting that makes the roll reach the wire; "reorder" would
+    // leave the library's own defaults in place and change the JA4.
+    cipherMode = 'exact';
+    extensionMode = 'exact';
     sniMode = 'present';
     tlsMin = versions.tlsMin;
     tlsMax = versions.tlsMax;

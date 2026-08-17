@@ -16,11 +16,11 @@ Options:
   --lib <nss|openssl|boringssl>   Target library (required)
   --fixture <name>                Fixture name (e.g. firefox-128, negative/parse_error)
   --target <url>                  HTTPS target (default: https://example.com)
-  --pcap <path>                   Optional pcap output path (requires tshark+sudo)
   --print-hash                    Print observed JA4 hash to stdout
   --record                        Update .expected with observed JA4 (auto-baseline)
   --expect-fail                   Invert: expect strict-handshake fail
   --no-network                    Skip live HTTP request, only check dump file
+  --allow-unverified              Pass when no JA4 could be observed (dump-only)
   -h, --help                      Show this help
 USAGE
 }
@@ -28,22 +28,26 @@ USAGE
 LIB=""
 FIXTURE=""
 TARGET="${JA4_VERIFY_TARGET:-https://example.com}"
-PCAP=""
 PRINT_HASH=0
 RECORD=0
 EXPECT_FAIL=0
 NO_NETWORK=0
+ALLOW_UNVERIFIED=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --lib) LIB="$2"; shift 2 ;;
     --fixture) FIXTURE="$2"; shift 2 ;;
     --target) TARGET="$2"; shift 2 ;;
-    --pcap) PCAP="$2"; shift 2 ;;
+    --pcap)
+      echo "[error] --pcap is not implemented: no capture is taken anywhere in this script." >&2
+      echo "[hint]  Capture separately, e.g. sudo tcpdump -i any -w \"$2\" 'tcp port 443'" >&2
+      exit 2 ;;
     --print-hash) PRINT_HASH=1; shift ;;
     --record) RECORD=1; shift ;;
     --expect-fail) EXPECT_FAIL=1; shift ;;
-    --no-network) NO_NETWORK=1; shift ;;
+    --no-network) NO_NETWORK=1; ALLOW_UNVERIFIED=1; shift ;;
+    --allow-unverified) ALLOW_UNVERIFIED=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[error] unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -83,12 +87,20 @@ run_lib() {
         >"$RUN_OUT" 2>"$RUN_ERR" || rc=$?
       ;;
     nss)
-      bash "$SCRIPT_DIR/run_curl_with_ja4.sh" \
-        --config "$CONF_FILE" \
-        --dump "$DUMP_FILE" \
-        -- -sSk -o "$HTTP_OUT" "$TARGET" \
-        >"$RUN_OUT" 2>"$RUN_ERR" || rc=$?
-      echo "[warn] NSS HTTP path uses curl-link; for browser-driven fixtures use scripts/run_firefox_with_ja4.sh manually" >&2
+      # run_curl_with_ja4.sh drives OPENSSL_JA4_CONFIG against the OpenSSL
+      # build — there is no NSS-linked curl in this repo. Running it here and
+      # labelling the result "nss" produced a green line that said nothing
+      # about NSS at all, so refuse instead of reporting a false pass.
+      cat >&2 <<'NSSERR'
+[error] --lib nss is not wired to an NSS-linked client.
+        scripts/run_curl_with_ja4.sh drives the OpenSSL build
+        (OPENSSL_JA4_CONFIG), so verifying "nss" through it would report an
+        OpenSSL result under an NSS label.
+        Drive the NSS path with a patched Firefox instead:
+          scripts/run_firefox_with_ja4.sh --config <fixture>.conf --dump <path>
+        and compare the dump against the fixture manually.
+NSSERR
+      exit 2
       ;;
     boringssl)
       # Parse TARGET URL into host[:port], SNI, and HTTP path for the bssl
@@ -174,7 +186,6 @@ fi
 
 mismatch=$(read_kv "$DUMP_FILE" mismatch_mask)
 apply_ok=$(read_kv "$DUMP_FILE" apply_ok)
-
 # Negative fixture path.
 exp_bit=$(read_exp_kv expect_mismatch_bit || true)
 if [[ -n "$exp_bit" ]]; then
@@ -193,6 +204,17 @@ if [[ -n "$exp_bit" ]]; then
 fi
 
 # Positive fixture path.
+# active=0 means the library threw the whole config away and sent its own
+# ClientHello. It still writes apply_ok=1 / mismatch_mask=0 in that state, so
+# checking those alone would pass a run that never applied the fixture at all.
+# (Negative fixtures are handled above; a parse_error legitimately yields
+# active=0.)
+active=$(read_kv "$DUMP_FILE" active)
+if [[ "$active" != "1" ]]; then
+  echo "[FAIL] $FIXTURE/$LIB: dump reports active=$active — the config was not applied, the client sent its native fingerprint" >&2
+  exit 1
+fi
+
 exp_mismatch=$(read_exp_kv mismatch_mask || echo 0)
 exp_apply=$(read_exp_kv apply_ok || echo 1)
 if [[ "$mismatch" != "$exp_mismatch" ]]; then
@@ -280,7 +302,25 @@ if [[ "$RECORD" -eq 1 && -n "$observed_ja4" ]]; then
   echo "[record] $FIXTURE/$LIB: expected_ja4 -> $observed_ja4"
 fi
 
-if [[ "$RECORD" -eq 0 && -n "$exp_ja4" && "$exp_ja4" != "auto-baseline" && -n "$observed_ja4" ]]; then
+if [[ "$RECORD" -eq 0 && -n "$exp_ja4" && "$exp_ja4" != "auto-baseline" ]]; then
+  if [[ -z "$observed_ja4" ]]; then
+    # The dump only proves the library agrees with itself. Without an observed
+    # JA4 nothing here compares the emitted ClientHello against the fixture's
+    # expectation, and printing [OK] for that used to be the harness' loudest
+    # lie: the default target (https://example.com) never returns a JA4, so
+    # the documented invocation never once checked a hash.
+    if [[ "$ALLOW_UNVERIFIED" -eq 1 ]]; then
+      echo "[UNVERIFIED] $FIXTURE/$LIB: dump conforms, but no JA4 was observed — expected_ja4=$exp_ja4 was NOT checked"
+      exit 0
+    fi
+    cat >&2 <<EOF
+[FAIL] $FIXTURE/$LIB: no JA4 observed, so expected_ja4=$exp_ja4 was never compared.
+       The dump alone cannot prove the emitted ClientHello matches the fixture.
+       Point --target at an endpoint that echoes the JA4 (e.g. a /raw or /json
+       observation service), or accept a dump-only run with --allow-unverified.
+EOF
+    exit 1
+  fi
   if [[ "$exp_ja4" != "$observed_ja4" ]]; then
     echo "[FAIL] $FIXTURE/$LIB: ja4 hash mismatch (expected $exp_ja4, got $observed_ja4)" >&2
     exit 1
@@ -291,4 +331,8 @@ if [[ "$PRINT_HASH" -eq 1 && -n "$observed_ja4" ]]; then
   echo "$observed_ja4"
 fi
 
-echo "[OK] $FIXTURE/$LIB: dump conforms, mismatch_mask=0, apply_ok=1${observed_ja4:+, ja4=$observed_ja4}"
+if [[ -n "$observed_ja4" ]]; then
+  echo "[OK] $FIXTURE/$LIB: dump conforms, mismatch_mask=0, apply_ok=1, ja4=$observed_ja4 (verified against expectation)"
+else
+  echo "[DUMP-OK] $FIXTURE/$LIB: dump conforms, mismatch_mask=0, apply_ok=1 — no JA4 comparison performed"
+fi

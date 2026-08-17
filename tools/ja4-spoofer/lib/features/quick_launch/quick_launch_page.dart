@@ -4,12 +4,14 @@ import 'package:flutter/material.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
 import '../../core/models/fingerprint_profile.dart';
+import '../../core/utils/fingerprint_enforcement.dart';
 import '../app_launcher/app_launcher_controller.dart';
 import '../configurator/configurator_controller.dart';
 import '../settings/settings_controller.dart';
 import 'quick_launch_controller.dart';
 import 'widgets/browser_tile.dart';
 import 'widgets/configurator_preview_card.dart';
+import 'widgets/fingerprint_verdict_panel.dart';
 import 'widgets/profile_selector_card.dart';
 import 'widgets/randomize_options_card.dart';
 
@@ -59,13 +61,13 @@ class QuickLaunchPage extends StatelessWidget {
     final isWide = width >= 1100;
 
     if (isWide) {
-      return _buildWideLayout(qlc);
+      return _buildWideLayout(context, qlc);
     } else {
-      return _buildNarrowLayout(qlc);
+      return _buildNarrowLayout(context, qlc);
     }
   }
 
-  Widget _buildWideLayout(QuickLaunchController qlc) {
+  Widget _buildWideLayout(BuildContext context, QuickLaunchController qlc) {
     return Row(
       key: const ValueKey('wide'),
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -81,14 +83,14 @@ class QuickLaunchPage extends StatelessWidget {
         Expanded(
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(20),
-            child: _buildRightColumn(qlc),
+            child: _buildRightColumn(context, qlc),
           ),
         ),
       ],
     );
   }
 
-  Widget _buildNarrowLayout(QuickLaunchController qlc) {
+  Widget _buildNarrowLayout(BuildContext context, QuickLaunchController qlc) {
     return SingleChildScrollView(
       key: const ValueKey('narrow'),
       padding: const EdgeInsets.all(20),
@@ -97,7 +99,7 @@ class QuickLaunchPage extends StatelessWidget {
         children: [
           _buildLeftColumn(qlc),
           const SizedBox(height: 16),
-          _buildRightColumn(qlc),
+          _buildRightColumn(context, qlc),
         ],
       ),
     );
@@ -124,7 +126,7 @@ class QuickLaunchPage extends StatelessWidget {
     );
   }
 
-  Widget _buildRightColumn(QuickLaunchController qlc) {
+  Widget _buildRightColumn(BuildContext context, QuickLaunchController qlc) {
     final lc = launcherController;
 
     final needsSetup =
@@ -205,7 +207,7 @@ class QuickLaunchPage extends StatelessWidget {
                 onMoveToConfigurator: () =>
                     qlc.moveRollToConfigurator(app.descriptor.appId),
                 onSmartLaunch: (a) {
-                  unawaited(lc.smartLaunch(a, profile: profile));
+                  unawaited(_smartLaunchGuarded(context, lc, a, profile));
                 },
                 onStop: (a) {
                   lc.stopApp(a);
@@ -219,5 +221,35 @@ class QuickLaunchPage extends StatelessWidget {
           }),
       ],
     );
+  }
+
+  /// Launches [app], but stops first when the selected profile provably
+  /// cannot reach the wire intact and lets the user decide what to do.
+  ///
+  /// "Beheben & starten" rewrites the profile for this launch only — the
+  /// stored profile is left alone, and the corrected target JA4 is what the
+  /// verdict panel then shows.
+  static Future<void> _smartLaunchGuarded(
+    BuildContext context,
+    AppLauncherController lc,
+    AppState app,
+    FingerprintProfile profile,
+  ) async {
+    await lc.smartLaunch(app, profile: profile);
+    if (!app.enforcementAwaitingDecision) return;
+
+    final report = app.enforcement;
+    if (report == null || !context.mounted) return;
+
+    final decision = await showEnforcementDialog(context, report);
+    switch (decision) {
+      case EnforcementDecision.cancel:
+        lc.dismissEnforcement(app);
+      case EnforcementDecision.launchAnyway:
+        await lc.smartLaunch(app, profile: profile, force: true);
+      case EnforcementDecision.autoFix:
+        final fixed = applyEnforcementAutoFixes(profile, report);
+        await lc.smartLaunch(app, profile: fixed, force: true);
+    }
   }
 }

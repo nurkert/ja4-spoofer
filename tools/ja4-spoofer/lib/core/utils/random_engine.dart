@@ -5,6 +5,8 @@ import 'package:crypto/crypto.dart';
 
 import '../models/app_descriptor.dart';
 import '../models/fingerprint_profile.dart';
+import '../models/ja4_stack.dart';
+import 'fingerprint_enforcement.dart';
 
 /// Pool used to choose replacement IDs for a component.
 ///
@@ -327,7 +329,7 @@ class RandomEngine {
       extensionMode: 'exact',
     );
 
-    final profile = FingerprintProfile(
+    final rolled = FingerprintProfile(
       profileId: 'random-${app.appId}-$subSeedHex',
       metadata: FingerprintProfileMetadata(
         name: '${app.metadata.name} (random $subSeedHex)',
@@ -335,6 +337,16 @@ class RandomEngine {
         profileFormat: app.launch.profileFormat,
       ),
       inputs: inputs,
+    );
+
+    // A roll must be launchable as-is. Without this, a roll whose extension
+    // list omits an id implied by its own ALPN/SNI settings would be held back
+    // by the pre-flight check — and the JA4 shown next to it would not be the
+    // one the library ends up sending.
+    final stack = Ja4Stack.fromProfileFormat(app.launch.profileFormat);
+    final profile = applyEnforcementAutoFixes(
+      rolled,
+      checkFingerprintEnforcement(profile: rolled, stack: stack),
     );
 
     return RolledProfile(profile: profile, subSeedHex: subSeedHex);

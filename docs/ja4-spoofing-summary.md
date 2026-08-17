@@ -5,8 +5,8 @@ BoringSSL, NSS and OpenSSL paths.
 
 ## Current Capability
 
-JA4 Spoofer can deterministically control the JA4-relevant parts of the
-ClientHello for the supported clients:
+JA4 Spoofer controls the JA4-relevant parts of the ClientHello for the
+supported clients:
 
 - Chromium / Brave-style builds through patched BoringSSL,
 - Firefox through patched NSS,
@@ -30,7 +30,25 @@ The runtime hooks expose controls for:
 
 In `exact` mode, the patch stacks can emit raw cipher and extension IDs that are
 not present in the TLS library's normal built-in tables. This makes JA4 hash
-experiments possible even for unusual or vendor-specific IDs.
+experiments possible even for unusual or vendor-specific IDs. Such IDs are
+emitted as synthetic stubs with an empty body: the JA4 matches, the extension
+content does not.
+
+Control is not unconditional, and the difference matters:
+
+- `reorder` mode (the default when a list is given without an explicit
+  `*_mode`) keeps the library's own ciphers and extensions alongside the
+  requested ones. The counts change, so the JA4 changes.
+- A body override whose extension ID is missing from `extension_order` causes
+  the stacks to append that ID silently, which also changes the JA4.
+- OpenSSL cannot regenerate `key_share` and rewrites extension bodies only when
+  the replacement has the same length.
+- Any config the stack rejects is discarded whole, and the dump then reports
+  `active=0` with `apply_ok=1`.
+
+The GUI checks the first two before launching and reports all of them
+afterwards; see [Verification](#verification-harness) below. Treat a launch
+without a read-back dump as unverified.
 
 ## What This Does Not Mean
 

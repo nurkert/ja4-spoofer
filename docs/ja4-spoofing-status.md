@@ -59,12 +59,31 @@ Run the fixture harness:
 scripts/ja4_verify.sh
 ```
 
+The harness now fails instead of printing `[OK]` when no JA4 could be observed:
+the dump alone only proves the library agrees with itself. Point `--target` at
+an endpoint that echoes the JA4, or pass `--allow-unverified` to accept an
+explicit dump-only run.
+
 For a full multi-stack run:
 
 ```bash
-LIBS="openssl nss boringssl" FIXTURES="firefox-128 chrome-131 zen-1.x tor-13" \
-  bash scripts/ja4_verify_all.sh verify
+LIBS="openssl boringssl" FIXTURES="firefox-128 chrome-131 zen-1.x tor-13" \
+  bash scripts/ja4_verify_all.sh verify --target https://<ja4-observer>/raw
 ```
+
+`--lib nss` is intentionally not part of that set: no NSS-linked CLI client
+ships here, so the NSS path has to be driven through a patched Firefox with
+`scripts/run_firefox_with_ja4.sh`.
+
+Fixture self-consistency is checked separately and needs no build:
+
+```bash
+python3 scripts/ja4_fixture_check.py
+```
+
+It recomputes each fixture's JA4 from its own `.conf` and rejects an
+`expected_ja4` that no run could produce, plus configs whose `extension_order`
+omits an ID implied by their own body overrides. CI runs it on every PR.
 
 The harness validates:
 

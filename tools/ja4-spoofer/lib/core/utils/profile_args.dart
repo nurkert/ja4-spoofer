@@ -3,10 +3,10 @@ import '../models/fingerprint_profile.dart';
 /// Converts a [FingerprintProfile] to CLI args for run_*_with_ja4.sh scripts.
 List<String> profileToArgs(FingerprintProfile profile) {
   final inputs = profile.inputs;
-  final cipherMode = _effectiveCipherMode(profile);
-  final extensionMode = _effectiveExtensionMode(profile);
-  final enableGrease = _effectiveEnableGrease(profile);
-  final enableChXtnPermutation = _effectiveEnableChXtnPermutation(profile);
+  final cipherMode = effectiveCipherMode(profile);
+  final extensionMode = effectiveExtensionMode(profile);
+  final enableGrease = effectiveEnableGrease(profile);
+  final enableChXtnPermutation = effectiveEnableChXtnPermutation(profile);
   return [
     if (inputs.tlsMinVersion.isNotEmpty) ...['--tls-min', inputs.tlsMinVersion],
     if (inputs.tlsMaxVersion.isNotEmpty) ...['--tls-max', inputs.tlsMaxVersion],
@@ -52,7 +52,7 @@ List<String> profileToArgs(FingerprintProfile profile) {
   ];
 }
 
-String? _effectiveCipherMode(FingerprintProfile profile) {
+String? effectiveCipherMode(FingerprintProfile profile) {
   final explicit = profile.inputs.cipherMode;
   if (explicit != null && explicit.isNotEmpty) return explicit;
 
@@ -63,7 +63,7 @@ String? _effectiveCipherMode(FingerprintProfile profile) {
   return null;
 }
 
-String? _effectiveExtensionMode(FingerprintProfile profile) {
+String? effectiveExtensionMode(FingerprintProfile profile) {
   final explicit = profile.inputs.extensionMode;
   if (explicit != null && explicit.isNotEmpty) return explicit;
   final isCapturedReplay = profile.metadata.source == 'captured';
@@ -73,7 +73,7 @@ String? _effectiveExtensionMode(FingerprintProfile profile) {
   return null;
 }
 
-bool _effectiveEnableGrease(FingerprintProfile profile) {
+bool effectiveEnableGrease(FingerprintProfile profile) {
   // JA4 is GREASE-stable by spec — the hasher strips RFC 8701 GREASE values
   // from ciphers/extensions/sigalgs/supported-versions before SHA256, so the
   // real tool always produces the same JA4 across connections. The capture
@@ -90,7 +90,7 @@ bool _effectiveEnableGrease(FingerprintProfile profile) {
   return profile.inputs.enableGrease;
 }
 
-bool _effectiveEnableChXtnPermutation(FingerprintProfile profile) {
+bool effectiveEnableChXtnPermutation(FingerprintProfile profile) {
   // Captured profiles encode a concrete extension order (replayed via
   // extension_mode='exact'). Re-permuting on top would shuffle the replayed
   // order and break JA4_c. The capture pipeline already records

@@ -8,6 +8,7 @@ import '../../../app/widgets/terminal_box.dart';
 import '../../../core/models/app_descriptor.dart';
 import '../../../core/models/fingerprint_profile.dart';
 import '../../app_launcher/app_launcher_controller.dart';
+import 'fingerprint_verdict_panel.dart';
 
 /// Generic app tile for the Quick Launch page.
 ///
@@ -248,6 +249,13 @@ class _BrowserTileState extends State<BrowserTile> {
                 _buildActionButton(app, isBusy, isRunning),
               ],
             ],
+          ),
+          // Does the selected fingerprint actually reach the wire?
+          const SizedBox(height: 10),
+          FingerprintVerdictPanel(
+            enforcement: app.enforcement,
+            verdict: app.dumpVerdict,
+            isRunning: isRunning,
           ),
           // Output console
           if (app.output.isNotEmpty) ...[

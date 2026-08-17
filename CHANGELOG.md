@@ -4,6 +4,67 @@ All notable changes to JA4 Spoofer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-08-17
+
+Focus of this release: making the app answer one question honestly — is the
+fingerprint you selected the one that actually goes on the wire?
+
+### Added
+
+- **Pre-flight enforcement check.** Before a launch, the selected profile is
+  validated against the target's TLS stack. When the emitted ClientHello would
+  provably differ from the profile, the launch is held back and a dialog names
+  the field, the concrete deviation, its cause and the remedy. Mechanical
+  problems (missing `exact` modes, `key_share_groups` outside
+  `supported_groups`, inverted TLS bounds, extension IDs implied by a
+  configured body override) can be corrected in one click.
+- **Post-launch fingerprint verification.** The diagnostic dump the patched
+  library writes for its emitted ClientHello is now read back, the JA4 is
+  recomputed from the `final_*` values and compared against the profile. The
+  app tile reports whether the fingerprint was sent as selected and lists every
+  field that drifted, with the `mismatch_mask` decoded into plain sentences.
+- `scripts/ja4_fixture_check.py` recomputes each fixture's JA4 from its own
+  `.conf` and rejects unreachable `expected_ja4` values and configs whose
+  `extension_order` omits an ID implied by their own body overrides. CI runs it
+  on every PR; it needs no build and no network.
+- Test coverage asserting that every shipped seed profile launches without
+  blockers on all three stacks.
+
+### Changed
+
+- `Ja4HashPreview` now derives the JA4 version digit from `supported_versions`
+  when present, per the JA4 spec, instead of always using `tls_max`.
+- Random rolls and the configurator's full random roll now emit
+  `cipher_mode=exact` / `extension_mode=exact` and are closure-complete, so a
+  generated profile is launchable without a prompt.
+- `scripts/ja4_verify.sh` no longer prints `[OK]` when no JA4 was observed: the
+  dump alone cannot prove the emitted ClientHello matches the fixture. Use
+  `--allow-unverified` for an explicit dump-only run, which reports
+  `[DUMP-OK]`.
+- `scripts/ja4_verify.sh --lib nss` now fails with an explanation instead of
+  silently verifying the OpenSSL build under an NSS label.
+- `--pcap` now fails instead of being silently ignored; no capture was ever
+  taken.
+- README and `docs/ja4-spoofing-summary.md` describe the actual enforcement
+  ceilings (reorder mode, silent extension closure, OpenSSL's same-length body
+  rewrites, discarded configs) instead of claiming unconditional control.
+
+### Fixed
+
+- The configurator no longer drops `supported_versions`, `supported_groups`,
+  `key_share_groups` and `psk_key_exchange_modes`. Opening a profile there used
+  to strip all four, so the launched ClientHello stopped matching the profile.
+- The patch-freshness stamp is only written after a build that exited zero, and
+  is cleared when a build fails. A half-finished build previously left a binary
+  on disk that was certified fresh, letting later launches skip the rebuild.
+- The four positive JA4 fixtures carried `expected_ja4` values that were not
+  reproducible from their own configs, and three of them omitted the
+  `psk_key_exchange_modes` extension ID their config implied. Both are
+  corrected and now guarded by CI.
+- `scripts/ja4_verify.sh` asserts `active=1` for positive fixtures. A config the
+  library discarded wholesale reports `active=0` alongside `apply_ok=1` and
+  `mismatch_mask=0`, and used to pass.
+
 ## [1.4.0] — 2026-05-14
 
 ### Added

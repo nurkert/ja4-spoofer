@@ -6,9 +6,13 @@ import 'package:flutter/foundation.dart';
 
 import '../../core/models/app_descriptor.dart';
 import '../../core/models/fingerprint_profile.dart';
+import '../../core/models/ja4_stack.dart';
 import '../../core/services/app_descriptor_service.dart';
+import '../../core/services/dump_watcher_service.dart';
 import '../../core/services/patch_service.dart';
 import '../../core/services/script_launcher_service.dart';
+import '../../core/utils/fingerprint_enforcement.dart';
+import '../../core/utils/ja4_dump_verifier.dart';
 import '../../core/utils/profile_args.dart';
 
 enum AppBuildState { checking, notBuilt, patching, building, built, running }
@@ -34,8 +38,32 @@ class AppState {
   /// Guards against concurrent smartLaunch calls (e.g. double-clicks).
   bool smartLaunchInProgress = false;
 
+  /// Pre-flight result for the profile that is about to be launched. Set
+  /// whenever a launch is attempted; when it carries blockers the launch is
+  /// held back until the user acknowledges or auto-fixes them.
+  EnforcementReport? enforcement;
+
+  /// True while a blocking pre-flight result is waiting for the user's
+  /// decision. The UI shows the deviation dialog for this state.
+  bool enforcementAwaitingDecision = false;
+
+  /// Post-launch verdict: what the patched library reports it actually put on
+  /// the wire. Null while no verified ClientHello has been observed yet.
+  DumpVerdict? dumpVerdict;
+
+  /// Profile whose fingerprint the running process is supposed to carry.
+  FingerprintProfile? launchedProfile;
+
+  DumpWatcherService? dumpWatcher;
+  StreamSubscription<String>? dumpSub;
+
   bool get isRunning => runningScript != null;
   bool get isCli => descriptor.launch.runtime.isCli;
+
+  /// Patched TLS stack behind this target, or null when it is not one of the
+  /// three supported libraries.
+  Ja4Stack? get stack =>
+      Ja4Stack.fromProfileFormat(descriptor.launch.profileFormat);
 
   /// The submodule name derived from the app's profile format.
   String? get submoduleName => switch (descriptor.launch.profileFormat) {
@@ -66,6 +94,11 @@ class AppLauncherController extends ChangeNotifier {
   final String? repoRoot;
 
   bool get hasRepoRoot => repoRoot != null;
+
+  /// IANA-registered extension codepoints, used to warn about extensions the
+  /// stacks can only emit as empty synthetic stubs. Null until the registry
+  /// has loaded; the check is skipped rather than guessed while unset.
+  Set<int>? knownExtensionIds;
 
   bool loading = true;
   List<AppState> apps = [];
@@ -203,8 +236,22 @@ class AppLauncherController extends ChangeNotifier {
     _appendAppOutput(app, '[info] build exited (code=$code)\n');
     await _checkBuildStatus(app);
 
-    // After a successful build, write the patch-stamp so smartLaunch can
-    // detect when the on-disk binary becomes stale relative to patches/.
+    // Write the patch-stamp only when the build actually succeeded. The
+    // build-state probe merely tests whether a binary path exists, and a
+    // half-finished Chromium leaves `Chromium.app` behind — stamping that
+    // would certify an unpatched or stale binary as fresh and let every later
+    // launch skip the rebuild.
+    if (code != 0) {
+      _appendAppOutput(
+        app,
+        '[warn] build failed — binary is not certified fresh, '
+        'the next launch will rebuild\n',
+      );
+      await _clearPatchStamp(app);
+      app.buildState = AppBuildState.notBuilt;
+      notifyListeners();
+      return;
+    }
     if (app.buildState == AppBuildState.built) {
       await _writePatchStamp(app);
     }
@@ -214,6 +261,7 @@ class AppLauncherController extends ChangeNotifier {
     AppState app,
     List<String> extraArgs, {
     bool clearOutput = true,
+    FingerprintProfile? profile,
   }) async {
     if (app.isRunning) return;
     if (app.buildState != AppBuildState.built) return;
@@ -226,6 +274,7 @@ class AppLauncherController extends ChangeNotifier {
 
     app.buildState = AppBuildState.running;
     if (clearOutput) app.output = '';
+    _startDumpVerification(app, profile);
     notifyListeners();
 
     final finalArgs = <String>[...extraArgs];
@@ -249,7 +298,93 @@ class AppLauncherController extends ChangeNotifier {
           _launcherService.start(scriptPath: scriptPath, args: finalArgs),
     );
     _appendAppOutput(app, '[info] process exited (code=$code)\n');
+    await _finishDumpVerification(app);
     app.buildState = AppBuildState.built;
+    notifyListeners();
+  }
+
+  /// Arms the fingerprint read-back for a launch.
+  ///
+  /// The stale dump from a previous run is removed first: without that, a
+  /// process that never applies the config at all would be verified against
+  /// the previous run's file and reported as a success.
+  void _startDumpVerification(AppState app, FingerprintProfile? profile) {
+    _stopDumpVerification(app);
+    app.dumpVerdict = null;
+    app.launchedProfile = profile;
+    if (profile == null) return;
+
+    final dumpPath = app.descriptor.launch.dumpPath;
+    if (dumpPath == null) return;
+
+    try {
+      final file = File(dumpPath);
+      if (file.existsSync()) file.deleteSync();
+    } catch (e) {
+      _appendAppOutput(app, '[warn] could not clear stale dump: $e\n');
+    }
+
+    final watcher = DumpWatcherService();
+    app.dumpWatcher = watcher;
+    app.dumpSub = watcher.onChange.listen((content) {
+      final verdict = const Ja4DumpVerifier().verify(
+        dumpContent: content,
+        profile: profile,
+      );
+      app.dumpVerdict = verdict;
+      _appendAppOutput(app, '[ja4] ${verdict.headline}\n');
+      for (final deviation in verdict.deviations) {
+        _appendAppOutput(
+          app,
+          '[ja4]   ${deviation.field}: angefordert=${deviation.requested} '
+          'gesendet=${deviation.actual}\n',
+        );
+      }
+      notifyListeners();
+    });
+    watcher.start(dumpPath);
+  }
+
+  /// Called when the launched process is gone. A launch that produced no dump
+  /// at all never applied the fingerprint — that has to read as a failure, not
+  /// as an absent result.
+  Future<void> _finishDumpVerification(AppState app) async {
+    final hadProfile = app.launchedProfile != null;
+    final hasDumpPath = app.descriptor.launch.dumpPath != null;
+    _stopDumpVerification(app);
+    if (hadProfile && hasDumpPath && app.dumpVerdict == null) {
+      app.dumpVerdict = const Ja4DumpVerifier().noDump();
+      _appendAppOutput(app, '[ja4] ${app.dumpVerdict!.headline}\n');
+    }
+  }
+
+  void _stopDumpVerification(AppState app) {
+    unawaited(app.dumpSub?.cancel() ?? Future<void>.value());
+    app.dumpSub = null;
+    app.dumpWatcher?.dispose();
+    app.dumpWatcher = null;
+  }
+
+  /// Re-runs the pre-flight check for [app] against [profile] without
+  /// launching anything. Used by the UI to keep the deviation panel live while
+  /// the user edits the profile.
+  EnforcementReport refreshEnforcement(
+    AppState app,
+    FingerprintProfile profile,
+  ) {
+    final report = checkFingerprintEnforcement(
+      profile: profile,
+      stack: app.stack,
+      knownExtensionIds: knownExtensionIds,
+    );
+    app.enforcement = report;
+    notifyListeners();
+    return report;
+  }
+
+  /// Clears a held-back launch after the user decided against it.
+  void dismissEnforcement(AppState app) {
+    app.enforcementAwaitingDecision = false;
     notifyListeners();
   }
 
@@ -259,8 +394,27 @@ class AppLauncherController extends ChangeNotifier {
   /// against older patches is treated as "not built" — smartLaunch falls
   /// through to re-patch + rebuild. The freshness signal is the patch-stamp
   /// written by [buildApp] on success.
-  Future<void> smartLaunch(AppState app, {FingerprintProfile? profile}) async {
+  /// Set [force] to launch despite a blocking pre-flight verdict.
+  Future<void> smartLaunch(
+    AppState app, {
+    FingerprintProfile? profile,
+    bool force = false,
+  }) async {
     if (app.smartLaunchInProgress) return;
+
+    // Pre-flight: refuse to launch a profile that provably cannot reach the
+    // wire intact. Measuring against a fingerprint the stack silently rewrote
+    // is worse than not measuring at all, so the user has to see what will
+    // deviate and why before this proceeds.
+    if (profile != null) {
+      final report = refreshEnforcement(app, profile);
+      if (report.hasBlockers && !force) {
+        app.enforcementAwaitingDecision = true;
+        notifyListeners();
+        return;
+      }
+    }
+    app.enforcementAwaitingDecision = false;
     app.smartLaunchInProgress = true;
 
     final sub = app.submoduleName;
@@ -280,7 +434,7 @@ class AppLauncherController extends ChangeNotifier {
       // skip the per-submodule mutex in this fast path.
       if (app.buildState == AppBuildState.built &&
           await _patchStampMatches(app)) {
-        await launchApp(app, args);
+        await launchApp(app, args, profile: profile);
         return;
       }
 
@@ -319,7 +473,7 @@ class AppLauncherController extends ChangeNotifier {
       if (app.buildState != AppBuildState.built) return;
 
       // 3. Launch (keep prior output from patch + build steps)
-      await launchApp(app, args, clearOutput: false);
+      await launchApp(app, args, clearOutput: false, profile: profile);
     } finally {
       if (release != null && sub != null) {
         if (_submoduleLocks[sub] == release.future) {
@@ -436,6 +590,16 @@ class AppLauncherController extends ChangeNotifier {
     }
   }
 
+  /// Drops a stale stamp so the next launch is forced through patch + build.
+  Future<void> _clearPatchStamp(AppState app) async {
+    try {
+      final file = File(_patchStampPath(app));
+      if (file.existsSync()) await file.delete();
+    } catch (e) {
+      _appendAppOutput(app, '[warn] could not clear patch stamp: $e\n');
+    }
+  }
+
   /// True iff a patch-stamp exists for [app] AND it matches the current
   /// hash of patches/<sub>/*.patch. False on first run, after patches
   /// change, or if patches dir is missing.
@@ -454,24 +618,14 @@ class AppLauncherController extends ChangeNotifier {
 
   List<String> _profileArgsForApp(AppState app, FingerprintProfile profile) {
     final args = List<String>.from(profileToArgs(profile));
-    final isOpenSsl = app.descriptor.launch.profileFormat == 'openssl';
-    final isCaptured = profile.metadata.source == 'captured';
-    final shouldForceExactExtensions =
-        isOpenSsl &&
-        isCaptured &&
-        profile.inputs.extensions.isNotEmpty &&
-        (profile.inputs.extensionMode == null ||
-            profile.inputs.extensionMode!.isEmpty) &&
-        !args.contains('--extension-mode');
-    if (shouldForceExactExtensions) {
-      args.addAll(const ['--extension-mode', 'exact']);
-    }
     // Don't auto-force strict=1 here. Captured profiles often contain ciphers
     // or extensions the patched lib's cipher table doesn't know (RC4, 3DES,
     // SCSV markers, vendor-private IDs). Strict turns those into hard
     // handshake aborts; for launch we prefer best-effort replay so the user
     // actually gets a connection. Strict is still available via explicit
-    // --strict 1 from the configurator or extra args.
+    // --strict 1 from the configurator or extra args. The post-launch
+    // verification is what turns that tolerance into a visible result:
+    // whatever the library silently substituted shows up in the dump verdict.
     return args;
   }
 
@@ -554,6 +708,7 @@ class AppLauncherController extends ChangeNotifier {
     for (final app in apps) {
       unawaited(app.stdoutSub?.cancel() ?? Future<void>.value());
       unawaited(app.stderrSub?.cancel() ?? Future<void>.value());
+      _stopDumpVerification(app);
       if (app.runningScript != null) {
         _launcherService.stop(app.runningScript!.process, force: true);
       }

@@ -46,6 +46,30 @@ jobs:
         working-directory: tools/ja4-spoofer
         run: flutter test
 
+  fixtures:
+    name: JA4 fixture consistency
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Recomputes the JA4 of every fixture from its own .conf and compares it
+      # against the recorded expected_ja4. Needs no build and no network, so it
+      # runs on every PR — unlike scripts/ja4_verify.sh, which requires the
+      # patched libraries and a JA4 observation endpoint.
+      #
+      # This guards the class of bug that made the acceptance harness
+      # meaningless: an expected_ja4 that no run can produce, combined with a
+      # harness that only compares the hash when one happens to be observed.
+      - name: Check fixtures are self-consistent
+        run: python3 scripts/ja4_fixture_check.py
+
   shell:
     name: ShellCheck
     runs-on: ubuntu-latest
