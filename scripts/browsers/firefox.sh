@@ -20,3 +20,7 @@ BROWSER_PROFILE_FORMAT="flag"
 BROWSER_EXTRA_DEFAULT_ARGS=("-no-remote")
 BROWSER_DEFAULT_URL="about:blank"
 BROWSER_BUILD_HINT="scripts/build_firefox_with_patched_nss.sh"
+# Binaries outside this prefix cannot have been produced by our build and are
+# flagged before launch — a stock Firefox links the system NSS and ignores
+# NSS_JA4_CONFIG entirely.
+BROWSER_BUILD_PREFIX="$HOME/build/firefox-ja4-stable"

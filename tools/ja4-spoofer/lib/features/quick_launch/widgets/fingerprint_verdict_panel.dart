@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
+import '../../../core/services/ja4_verification_probe.dart';
 import '../../../core/utils/fingerprint_enforcement.dart';
 import '../../../core/utils/ja4_dump_verifier.dart';
 
@@ -38,20 +39,41 @@ class FingerprintVerdictPanel extends StatelessWidget {
     super.key,
     required this.enforcement,
     required this.verdict,
+    this.observation,
     this.isRunning = false,
+    this.isMeasuring = false,
   });
 
   final EnforcementReport? enforcement;
   final DumpVerdict? verdict;
+
+  /// Independent measurement from the local probe. Outranks everything else.
+  final WireObservation? observation;
+
   final bool isRunning;
+  final bool isMeasuring;
 
   @override
   Widget build(BuildContext context) {
     final report = enforcement;
     if (report == null) return const SizedBox.shrink();
 
-    // A finished launch outranks the pre-flight prediction: it is a
-    // measurement rather than a forecast.
+    if (isMeasuring) {
+      return _Banner(
+        color: _VerdictColors.info,
+        icon: LucideIcons.radar,
+        title: 'Messe den gesendeten ClientHello …',
+        subtitle:
+            'Der Client verbindet sich einmal gegen einen lokalen Prüf-Server; '
+            'der Handshake bricht dabei absichtlich ab.',
+      );
+    }
+
+    // Ranking: an outside measurement beats the library's self-report, which
+    // beats the pre-flight forecast.
+    if (observation != null) {
+      return _ObservationBanner(observation: observation!, verdict: verdict);
+    }
     if (verdict != null) {
       return _VerdictBanner(verdict: verdict!, report: report);
     }
@@ -103,6 +125,96 @@ class _PreflightSummary extends StatelessWidget {
       title: title,
       subtitle: 'Ziel-JA4: ${report.intendedJa4}',
       details: report.issues.isEmpty ? null : _IssueList(issues: report.issues),
+    );
+  }
+}
+
+/// Renders the independent wire measurement — the only result here that does
+/// not depend on the patched library reporting truthfully about itself.
+class _ObservationBanner extends StatelessWidget {
+  const _ObservationBanner({required this.observation, this.verdict});
+
+  final WireObservation observation;
+  final DumpVerdict? verdict;
+
+  @override
+  Widget build(BuildContext context) {
+    final ok = observation.matches;
+    final unknown = observation.status != WireProbeStatus.observed;
+    final color = ok
+        ? _VerdictColors.ok
+        : (unknown ? _VerdictColors.warning : _VerdictColors.blocker);
+    final icon = ok
+        ? LucideIcons.shieldCheck
+        : (unknown ? LucideIcons.triangleAlert : LucideIcons.shieldX);
+
+    final subtitle = switch (observation.observedJa4) {
+      null => observation.error ?? 'Ausgewählt: ${observation.intendedJa4}',
+      final measured when measured == observation.intendedJa4 =>
+        'Gesendet: $measured',
+      final measured =>
+        'Ausgewählt: ${observation.intendedJa4}\nGemessen:   $measured',
+    };
+
+    return _Banner(
+      color: color,
+      icon: icon,
+      title: observation.headline,
+      subtitle: subtitle,
+      details: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Unabhängig gemessen: der ClientHello wurde von einem lokalen '
+            'Socket gelesen, nicht von der Library gemeldet.',
+            style: TextStyle(fontSize: 11, color: Colors.grey),
+          ),
+          const SizedBox(height: 8),
+          for (final deviation in observation.deviations)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: _DeviationView(deviation: deviation),
+            ),
+          if (verdict != null) ...[
+            const Divider(height: 18),
+            Text(
+              'Selbstauskunft der Library: ${verdict!.headline}',
+              style: const TextStyle(fontSize: 11, color: Colors.grey),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _DeviationView extends StatelessWidget {
+  const _DeviationView({required this.deviation});
+
+  final DumpDeviation deviation;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          deviation.field,
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+        ),
+        Text(
+          'angefordert: ${deviation.requested}',
+          style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+        ),
+        Text(
+          'gesendet:    ${deviation.actual}',
+          style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+        ),
+        Text(
+          deviation.reason,
+          style: const TextStyle(fontSize: 11, color: Colors.grey),
+        ),
+      ],
     );
   }
 }
@@ -161,30 +273,7 @@ class _Details extends StatelessWidget {
         for (final deviation in verdict.deviations)
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  deviation.field,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                Text(
-                  'angefordert: ${deviation.requested}',
-                  style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
-                ),
-                Text(
-                  'gesendet:    ${deviation.actual}',
-                  style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
-                ),
-                Text(
-                  deviation.reason,
-                  style: const TextStyle(fontSize: 11, color: Colors.grey),
-                ),
-              ],
-            ),
+            child: _DeviationView(deviation: deviation),
           ),
       ],
     );

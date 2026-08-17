@@ -37,9 +37,18 @@ class Ja4CaptureServer {
     this.port = 8443,
     this.maxHistory = 500,
     this.deduplicationWindow = const Duration(seconds: 5),
-  });
+    InternetAddress? bindAddress,
+  }) : bindAddress = bindAddress ?? InternetAddress.anyIPv4;
 
+  /// Requested listen port. Pass `0` for an ephemeral port and read the
+  /// assigned one from [boundPort] after [start].
   final int port;
+
+  /// Interface to listen on. Defaults to all IPv4 so captures can come from
+  /// other devices; the verification probe overrides this with loopback so a
+  /// self-check is never reachable from the LAN.
+  final InternetAddress bindAddress;
+
   final int maxHistory;
 
   /// Time window within which captures with the same JA4 hash are grouped.
@@ -54,6 +63,10 @@ class Ja4CaptureServer {
 
   bool get isRunning => _server != null;
 
+  /// Port the socket is actually listening on, or null while stopped.
+  /// Differs from [port] when an ephemeral port (`0`) was requested.
+  int? get boundPort => _server?.port;
+
   Stream<CaptureRecord> get onCapture => _controller.stream;
   List<CaptureRecord> get history => List.unmodifiable(_history);
   CaptureRecord? get lastCapture => _history.isEmpty ? null : _history.last;
@@ -64,7 +77,7 @@ class Ja4CaptureServer {
     // the LAN (phones, VMs). The server only reads the ClientHello bytes,
     // sends a TLS handshake_failure alert, and closes — no TLS termination,
     // no HTTP, no filesystem access — so LAN exposure is low-risk.
-    _server = await ServerSocket.bind(InternetAddress.anyIPv4, port);
+    _server = await ServerSocket.bind(bindAddress, port);
     _server!.listen(_handleConnection);
   }
 
@@ -174,6 +187,13 @@ class Ja4CaptureServer {
         .where((s) => !_greaseValues.contains(s))
         .toList();
 
+    final supportedVersions = hello.supportedVersions
+        .where((v) => !_greaseValues.contains(v))
+        .toList();
+    final supportedGroups = hello.supportedGroups
+        .where((g) => !_greaseValues.contains(g))
+        .toList();
+
     final tlsInputs = TlsClientHelloInputs(
       tlsMinVersion: hello.minTlsVersion,
       tlsMaxVersion: hello.maxTlsVersion,
@@ -181,6 +201,12 @@ class Ja4CaptureServer {
       extensions: extensions,
       signatureAlgorithms: sigAlgs,
       alpnProtocols: hello.alpnProtocols,
+      supportedVersions: supportedVersions,
+      supportedGroups: supportedGroups,
+      keyShareGroups: hello.keyShareGroups
+          .where((g) => !_greaseValues.contains(g))
+          .toList(),
+      pskKeyExchangeModes: hello.pskKeyExchangeModes,
       sniMode: hello.sniMode,
       enableGrease: hello.hasGrease,
       enableChXtnPermutation: false,
@@ -188,6 +214,9 @@ class Ja4CaptureServer {
 
     final ja4Hash = _hashPreview.compute(
       tlsMaxVersion: tlsInputs.tlsMaxVersion,
+      // Per the JA4 spec the version digit comes from supported_versions when
+      // that extension is present, not from the handshake version.
+      supportedVersions: tlsInputs.supportedVersions,
       sniMode: tlsInputs.sniMode,
       cipherSuites: tlsInputs.cipherSuites,
       extensions: tlsInputs.extensions,

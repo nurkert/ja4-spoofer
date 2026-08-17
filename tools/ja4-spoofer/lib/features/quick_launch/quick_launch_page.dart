@@ -216,6 +216,8 @@ class QuickLaunchPage extends StatelessWidget {
                   lc.updateLaunchArguments(a, value);
                 },
                 onClearOutput: (a) => lc.clearAppOutput(a),
+                onVerifyFingerprint: (a) =>
+                    unawaited(lc.verifyFingerprint(a, profile)),
               ),
             );
           }),

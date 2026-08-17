@@ -65,9 +65,21 @@ else
 fi
 
 if [[ -z "$browser_bin" ]]; then
-  echo "[error] no $BROWSER_NAME binary found automatically." >&2
-  echo "[hint] pass $BROWSER_BIN_OPTION <path> (built binary from $BROWSER_BUILD_HINT)." >&2
+  echo "[error] no patched $BROWSER_NAME binary found." >&2
+  echo "[hint] build it with $BROWSER_BUILD_HINT, or pass $BROWSER_BIN_OPTION <path>." >&2
+  echo "[note] a stock $BROWSER_NAME is deliberately not used as a fallback: it" >&2
+  echo "       ignores the JA4 environment and would send its own fingerprint." >&2
   exit 1
+fi
+
+# Provenance: a binary outside the build prefix was not produced by this tool,
+# so it is almost certainly linked against the system TLS library and will
+# ignore the JA4 config. Launching it anyway would look like success while the
+# native fingerprint goes on the wire, so say so loudly.
+if [[ -n "${BROWSER_BUILD_PREFIX:-}" && "$browser_bin" != "$BROWSER_BUILD_PREFIX"* ]]; then
+  echo "[warn] $browser_bin is outside the patched build tree ($BROWSER_BUILD_PREFIX)." >&2
+  echo "[warn] If it is not linked against the patched TLS library it will ignore" >&2
+  echo "       the JA4 config and send its own fingerprint. Verify the result." >&2
 fi
 
 # --- Handle existing processes ---

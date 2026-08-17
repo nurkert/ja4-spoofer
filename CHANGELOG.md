@@ -4,6 +4,46 @@ All notable changes to JA4 Spoofer are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] — 2026-08-17
+
+Closes the verification loop: until now every check in the app ultimately
+depended on the patched library reporting truthfully about itself.
+
+### Added
+
+- **Independent wire measurement** (`Ja4VerificationProbe`). A new
+  "Fingerprint messen" action binds a loopback-only TLS sniffer on an ephemeral
+  port, points the client at it once, reads the emitted ClientHello straight off
+  the socket and hashes it with the same JA4 implementation the profile uses.
+  The result outranks both the pre-flight forecast and the diagnostic dump, and
+  is the only signal that can expose deviations the dump cannot represent:
+  - OpenSSL echoes `final_alpn` back from the request, so `alpn_mismatch`
+    (`0x0100`) is unreachable there — an ALPN drift is invisible by
+    construction.
+  - When the stacks append an extension id implied by a body override, they
+    write the already-modified list back as `requested_*`, so
+    `requested == final` holds while the emitted JA4 differs.
+- Field-level comparison of the profile against the observed ClientHello.
+  Fields the profile leaves open are not reported as drift.
+- `TlsClientHelloParser` now exposes `keyShareGroups` (0x0033) and
+  `pskKeyExchangeModes` (0x002d), both fail-closed on truncated bodies, so the
+  wire comparison covers every field the diagnostic schema compares.
+
+### Changed
+
+- `Ja4CaptureServer` accepts a bind address and an ephemeral port, and reports
+  the port it actually got. The verification probe uses loopback so a self-check
+  is never reachable from the LAN; the capture feature keeps its previous
+  all-interfaces behaviour.
+- The capture path derives the JA4 version digit from `supported_versions` per
+  spec, matching the profile-side computation.
+- A stock Chromium is no longer an automatic fallback in
+  `scripts/browsers/chromium.sh`. A missing or half-finished build used to fall
+  through to `/Applications/Chromium.app`, which ignores `BORINGSSL_JA4_CONFIG`
+  entirely and sent its own fingerprint while the launcher reported success.
+- `scripts/run_browser.sh` warns when the resolved binary lies outside the
+  patched build tree, for both Chromium and Firefox.
+
 ## [1.5.0] — 2026-08-17
 
 Focus of this release: making the app answer one question honestly — is the
